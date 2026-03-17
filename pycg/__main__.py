@@ -18,6 +18,12 @@ def main():
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--no-analyze-external",
+        help="Don't analyze external defs",
+        action="store_true",
+        default=False,
+    )
     parser.add_argument("--product", help="Package name", default="")
     parser.add_argument(
         "--forge", help="Source the product was downloaded from", default=""
@@ -57,7 +63,7 @@ def main():
     args = parser.parse_args()
 
     cg = CallGraphGenerator(
-        args.entry_point, args.package, args.max_iter, args.operation
+        args.entry_point, args.package, args.max_iter, args.operation, args.no_analyze_external
     )
     cg.analyze()
 
@@ -76,13 +82,13 @@ def main():
 
     if args.output:
         with open(args.output, "w+") as f:
-            f.write(json.dumps(output))
+            f.write(json.dumps(output, indent=2))
     else:
-        print(json.dumps(output))
+        print(json.dumps(output, indent=2))
 
     if args.as_graph_output:
         with open(args.as_graph_output, "w+") as f:
-            f.write(json.dumps(as_formatter.generate()))
+            f.write(json.dumps(as_formatter.generate(), indent=2))
 
 
 if __name__ == "__main__":

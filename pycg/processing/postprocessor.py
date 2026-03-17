@@ -20,6 +20,8 @@
 #
 import ast
 
+# import objgraph
+
 from pycg import utils
 from pycg.machinery.definitions import Definition
 from pycg.processing.base import ProcessingBase
@@ -175,9 +177,7 @@ class PostProcessor(ProcessingBase):
 
     def visit_ClassDef(self, node):
         # create a definition for the class (node.name)
-        cls_def = self.def_manager.handle_class_def(self.current_ns, node.name)
-
-        # iterate bases to compute MRO for the class
+        cls_def = self.def_manager.handle_class_def(self.current_ns, node.name)        # iterate bases to compute MRO for the class
         cls = self.class_manager.get(cls_def.get_ns())
         if not cls:
             cls = self.class_manager.create(cls_def.get_ns(), self.modname)
@@ -338,5 +338,11 @@ class PostProcessor(ProcessingBase):
         )
 
     def analyze(self):
-        self.visit(ast.parse(self.contents, self.filename))
+        if (("/threading.py" in self.filename) and ("gevent" in self.filename)):
+            return
+        log.info('BEFORE VISIT')
+        # objgraph.show_growth(limit=5)
+        self.visit(ast.parse(self.contents, self.filename, type_comments=True))
+        log.info('BEFORE ANALYZE_SUBMODULE')
+        # objgraph.show_growth(limit=5)
         self.analyze_submodules()

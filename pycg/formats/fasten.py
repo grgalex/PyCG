@@ -185,22 +185,23 @@ class Fasten(BaseFormatter):
     def add_superclasses(self, mods):
         for cls_name, cls in self.classes.items():
             cls_uri = self.namespace_map.get(self.to_uri(cls["module"], cls_name))
-            mods[self.to_uri(cls["module"])]["namespaces"][cls_uri]["metadata"][
-                "superClasses"
-            ] = []
-            for parent in cls["mro"]:
-                if parent == cls_name:
-                    continue
-
-                if self.classes.get(parent):
-                    parent_uri = self.to_uri(self.classes[parent]["module"], parent)
-                else:
-                    parent_mod = parent.split(".")[0]
-                    parent_uri = self.to_external_uri(parent_mod, parent)
-
+            if cls_uri in mods[self.to_uri(cls["module"])]["namespaces"]:
                 mods[self.to_uri(cls["module"])]["namespaces"][cls_uri]["metadata"][
                     "superClasses"
-                ].append(parent_uri)
+                ] = []
+                for parent in cls["mro"]:
+                    if parent == cls_name:
+                        continue
+
+                    if self.classes.get(parent):
+                        parent_uri = self.to_uri(self.classes[parent]["module"], parent)
+                    else:
+                        parent_mod = parent.split(".")[0]
+                        parent_uri = self.to_external_uri(parent_mod, parent)
+
+                    mods[self.to_uri(cls["module"])]["namespaces"][cls_uri]["metadata"][
+                        "superClasses"
+                    ].append(parent_uri)
 
         return mods
 

@@ -19,6 +19,7 @@
 # under the License.
 #
 import os
+import sys
 
 from pycg import utils
 from pycg.machinery.callgraph import CallGraph
@@ -32,16 +33,27 @@ from pycg.processing.cgprocessor import CallGraphProcessor
 from pycg.processing.keyerrprocessor import KeyErrProcessor
 from pycg.processing.postprocessor import PostProcessor
 from pycg.processing.preprocessor import PreProcessor
+# import tracemalloc
+# tracemalloc.start()
+# import objgraph
+import signal
+import time
+
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Function execution timed out")
 
 
 class CallGraphGenerator(object):
-    def __init__(self, entry_points, package, max_iter, operation):
+    def __init__(self, entry_points, package, max_iter, operation, no_analyze_external):
         self.entry_points = entry_points
         self.package = package
+        self.no_analyze_external = no_analyze_external
         self.state = None
         self.max_iter = max_iter
         self.operation = operation
         self.setUp()
+        self.defs_per_module = {}
 
     def setUp(self):
         self.import_manager = ImportManager()
@@ -127,38 +139,67 @@ class CallGraphGenerator(object):
 
     def do_pass(self, cls, install_hooks=False, *args, **kwargs):
         modules_analyzed = set()
+        # count = 0
         for entry_point in self.entry_points:
-            input_pkg = self.package
-            input_mod = self._get_mod_name(entry_point, input_pkg)
-            input_file = os.path.abspath(entry_point)
+            # m1 = tracemalloc.take_snapshot()
+            try:
+                # print(entry_point)
+                # old_len_defs = len(self.def_manager.defs)
+                # timeout_duration =  60 *
+                # signal.signal(signal.SIGALRM, timeout_handler)
+                # signal.alarm(timeout_duration)
+                input_pkg = self.package
+                input_mod = self._get_mod_name(entry_point, input_pkg)
+                input_file = os.path.abspath(entry_point)
 
-            if not input_mod:
-                continue
+                if not input_mod:
+                    log.info(f'no mod_name for entry_point {entry_point}')
+                    continue
 
-            if not input_pkg:
-                input_pkg = os.path.dirname(input_file)
+                if not input_pkg:
+                    input_pkg = os.path.dirname(input_file)
 
-            if input_mod not in modules_analyzed:
-                if install_hooks:
-                    self.import_manager.set_pkg(input_pkg)
-                    self.import_manager.install_hooks()
+                if input_mod not in modules_analyzed:
+                    if install_hooks:
+                        self.import_manager.set_pkg(input_pkg)
+                        self.import_manager.install_hooks()
 
-                processor = cls(
-                    input_file,
-                    input_mod,
-                    modules_analyzed=modules_analyzed,
-                    *args,
-                    **kwargs,
-                )
-                processor.analyze()
-                modules_analyzed = modules_analyzed.union(
-                    processor.get_modules_analyzed()
-                )
+                    processor = cls(
+                        input_file,
+                        input_mod,
+                        modules_analyzed=modules_analyzed,
+                        *args,
+                        **kwargs,
+                    )
 
+                    processor.analyze()
+
+                    modules_analyzed = modules_analyzed.union(
+                        processor.get_modules_analyzed()
+                    )
+
+                    if install_hooks:
+                        self.remove_import_hooks()
+
+            # except TimeoutError:
+            #     signal.alarm(0)
+            #     print(f"Pass for {entry_point} timed out after {timeout_duration} seconds.")
+            except Exception as e:
+                # signal.alarm(0)
                 if install_hooks:
                     self.remove_import_hooks()
+            # new_len_defs = len(self.def_manager.defs)
+            # defs_added = new_len_defs - old_len_defs
+            # if defs_added > 0:
+            #     self.defs_per_module[entry_point] = defs_added
+        # signal.alarm(0)
+            # m2 = tracemalloc.take_snapshot()
+            # top_stats = m2.compare_to(m1, 'lineno')
+            # for stat in top_stats[:2]:
+            #     print(stat)
 
     def analyze(self):
+        # objgraph.show_growth(limit=5)
         self.do_pass(
             PreProcessor,
             True,
@@ -168,14 +209,27 @@ class CallGraphGenerator(object):
             self.class_manager,
             self.module_manager,
         )
-        self.def_manager.complete_definitions()
+        # objgraph.show_growth(limit=5)
+        # self.defs_per_module = dict(sorted(self.defs_per_module.items(), key=lambda item: item[1]))
+        # print(f'{self.defs_per_module}')
+        # self.defs_per_module = {}
+        # print(f'Completing definitions, len = {len(self.def_manager.defs)}')
 
+        self.def_manager.complete_definitions(False)
+        # objgraph.show_growth(limit=5)
+        # except TimeoutError:
+        #     print("Execution timed out after 0.5 hours")
+        # finally:
+        #     signal.alarm(0)
         iter_cnt = 0
         while (self.max_iter < 0 or iter_cnt < self.max_iter) and (
             not self.has_converged()
         ):
+            # objgraph.show_growth(limit=5)
             self.state = self.extract_state()
             self.reset_counters()
+            # objgraph.show_growth(limit=5)
+            # print('ENTERING do_pass PostProcessor')
             self.do_pass(
                 PostProcessor,
                 False,
@@ -185,8 +239,24 @@ class CallGraphGenerator(object):
                 self.class_manager,
                 self.module_manager,
             )
+            # objgraph.show_growth(limit=5)
 
-            self.def_manager.complete_definitions()
+            self.defs_per_module = dict(sorted(self.defs_per_module.items(), key=lambda item: item[1]))
+            # print(f'{self.defs_per_module}')
+            self.defs_per_module = {}
+
+            timeout_duration =  60 * 30
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout_duration)
+            try:
+                # print(f'Completing definitions, len = {len(self.def_manager.defs)}')
+                self.def_manager.complete_definitions(self.no_analyze_external)
+            except TimeoutError:
+                # print('TIMEOUT')
+                sys.exit(1)
+                # print(f"Execution timed out after {timeout_duration / 60} minutes.")
+            finally:
+                signal.alarm(0)
             iter_cnt += 1
 
         self.reset_counters()

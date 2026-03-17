@@ -111,7 +111,7 @@ class DefinitionManager(object):
 
         return closured
 
-    def complete_definitions(self):
+    def complete_definitions(self, no_analyze_external):
         # THE MOST expensive part of this tool's process
         # TODO: IMPROVE COMPLEXITY
         def update_pointsto_args(pointsto_args, arg, name):
@@ -119,11 +119,12 @@ class DefinitionManager(object):
             if arg == pointsto_args:
                 return False
             for pointsto_arg in pointsto_args:
-                if not self.defs.get(pointsto_arg, None):
+                pta = self.defs.get(pointsto_arg, None)
+                if not pta:
                     continue
                 if pointsto_arg == name:
                     continue
-                pointsto_arg_def = self.defs[pointsto_arg].get_name_pointer()
+                pointsto_arg_def = pta.points_to["name"]
                 if pointsto_arg_def == pointsto_args:
                     continue
 
@@ -132,8 +133,10 @@ class DefinitionManager(object):
                     arg.remove(pointsto_arg)
 
                 for item in arg:
-                    if item not in pointsto_arg_def.get():
-                        if self.defs.get(item, None) is not None:
+                    sdgi = self.defs.get(item, None)
+                    if item not in pointsto_arg_def.values:
+                        # if self.defs.get(item, None) is not None:
+                        if sdgi is not None:
                             changed_something = True
                     # HACK: this check shouldn't be needed
                     # if we remove this the following breaks:
@@ -141,42 +144,49 @@ class DefinitionManager(object):
                     # x(1)
                     # since on line 184 we don't discriminate between
                     # literal values and name values
-                    if not self.defs.get(item, None):
+                    if not sdgi:
                         continue
                     pointsto_arg_def.add(item)
             return changed_something
 
         for i in range(len(self.defs)):
+            # print(f'{i}/{len(self.defs)}')
             changed_something = False
             for ns, current_def in self.defs.items():
+                if no_analyze_external:
+                    if current_def.is_ext_def():
+                        continue
                 # the name pointer of the definition we're currently iterating
-                current_name_pointer = current_def.get_name_pointer()
+                current_name_pointer = current_def.points_to["name"]
                 # iterate the names the current definition points to items
                 # for name in current_name_pointer.get():
-                for name in current_name_pointer.get().copy():
+                for name in current_name_pointer.values.copy():
                     # get the name pointer of the points to name
-                    if not self.defs.get(name, None):
+                    sdgn = self.defs.get(name, None)
+                    if not sdgn:
                         continue
                     if name == ns:
                         continue
 
-                    pointsto_name_pointer = self.defs[name].get_name_pointer()
+                    pointsto_name_pointer = sdgn.points_to["name"]
                     # iterate the arguments of the definition
                     # we're currently iterating
-                    for arg_name, arg in current_name_pointer.get_args().items():
-                        pos = current_name_pointer.get_pos_of_name(arg_name)
+                    for arg_name, arg in current_name_pointer.args.items():
+                        # pos = current_name_pointer.get_pos_of_name(arg_name)
+                        pos = current_name_pointer.name_to_pos.get(arg_name, None)
                         if pos is not None:
                             pointsto_args = pointsto_name_pointer.get_pos_arg(pos)
                             if not pointsto_args:
                                 pointsto_name_pointer.add_pos_arg(pos, None, arg)
                                 continue
                         else:
-                            pointsto_args = pointsto_name_pointer.get_arg(arg_name)
+                            # pointsto_args = pointsto_name_pointer.get_arg(arg_name)
+                            pointsto_args = pointsto_name_pointer.args.get(arg_name, None)
                             if not pointsto_args:
                                 pointsto_name_pointer.add_arg(arg_name, arg)
                                 continue
                         changed_something = changed_something or update_pointsto_args(
-                            pointsto_args, arg, current_def.get_ns()
+                            pointsto_args, arg, current_def.fullns
                         )
 
             if not changed_something:
