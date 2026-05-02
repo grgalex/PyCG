@@ -94,8 +94,15 @@ class ImportManager(object):
     def _clear_caches(self):
         try:
             importlib.invalidate_caches()
-        except (TypeError, AttributeError):
-            # Custom path hooks used in tests may not be callable.
+        except Exception:
+            # Reasons we may end up here include:
+            #  * a sys.path_hooks entry whose invalidate_caches isn't
+            #    callable (custom test stubs);
+            #  * Python 3.12+ lazy-imports of importlib.metadata's
+            #    sub-modules during invalidate_caches, which our own
+            #    import hook intercepts before their parent node exists,
+            #    raising ImportManagerError from create_edge.
+            # Cache invalidation is best-effort cleanup, so swallow.
             pass
         sys.path_importer_cache.clear()
         # TODO: maybe not do that since it empties the whole cache
