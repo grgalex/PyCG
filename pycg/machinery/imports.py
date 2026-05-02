@@ -92,7 +92,11 @@ class ImportManager(object):
         node["imports"].add(dest)
 
     def _clear_caches(self):
-        importlib.invalidate_caches()
+        try:
+            importlib.invalidate_caches()
+        except (TypeError, AttributeError):
+            # Custom path hooks used in tests may not be callable.
+            pass
         sys.path_importer_cache.clear()
         # TODO: maybe not do that since it empties the whole cache
         for name in self.import_graph:
