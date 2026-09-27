@@ -19,12 +19,15 @@
 # under the License.
 #
 import ast
+import logging
 
 # import objgraph
 
 from pycg import utils
 from pycg.machinery.definitions import Definition
 from pycg.processing.base import ProcessingBase
+
+log = logging.getLogger(__name__)
 
 
 class PostProcessor(ProcessingBase):
@@ -340,9 +343,9 @@ class PostProcessor(ProcessingBase):
     def analyze(self):
         if (("/threading.py" in self.filename) and ("gevent" in self.filename)):
             return
-        log.info('BEFORE VISIT')
+        log.debug("visiting %s", self.modname)
         # objgraph.show_growth(limit=5)
         self.visit(ast.parse(self.contents, self.filename, type_comments=True))
-        log.info('BEFORE ANALYZE_SUBMODULE')
+        log.debug("analyzing submodules of %s", self.modname)
         # objgraph.show_growth(limit=5)
         self.analyze_submodules()

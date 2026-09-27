@@ -1,5 +1,7 @@
 import argparse
 import json
+import logging
+import sys
 
 from pycg import formats
 from pycg.pycg import CallGraphGenerator
@@ -7,6 +9,16 @@ from pycg.utils.constants import CALL_GRAPH_OP, KEY_ERR_OP
 
 
 def main():
+    # Without a handler, logging's last-resort fallback drops everything below
+    # WARNING and prints it unformatted. PyCG is normally run as a subprocess
+    # whose stderr the caller captures, and a swallowed per-entry-point failure
+    # is only visible through these records, so configure them explicitly.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("entry_point", nargs="*", help="Entry points to be processed")
     parser.add_argument(
