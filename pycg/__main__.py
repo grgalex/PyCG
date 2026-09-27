@@ -54,6 +54,21 @@ def main():
         default=-1,
     )
     parser.add_argument(
+        "--time-budget",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Wall-clock seconds the iterative phases (the complete_definitions "
+            "fixpoint and the post-processing passes) may spend in total. "
+            "When it runs out they stop iterating, a WARNING says which phase "
+            "stopped and after how many iterations, the result is marked "
+            "`incomplete` in the FASTEN output, and the call graph is written "
+            "out as usual: it is a sound but less precise fixpoint-in-progress. "
+            "0 (the default) means no limit."
+        ),
+        default=0,
+    )
+    parser.add_argument(
         "--operation",
         type=str,
         choices=[CALL_GRAPH_OP, KEY_ERR_OP],
@@ -75,7 +90,12 @@ def main():
     args = parser.parse_args()
 
     cg = CallGraphGenerator(
-        args.entry_point, args.package, args.max_iter, args.operation, args.no_analyze_external
+        args.entry_point,
+        args.package,
+        args.max_iter,
+        args.operation,
+        args.no_analyze_external,
+        time_budget=args.time_budget,
     )
     cg.analyze()
 

@@ -20,7 +20,6 @@
 #
 import logging
 import os
-import sys
 import traceback
 
 from pycg import utils
@@ -38,27 +37,71 @@ from pycg.processing.preprocessor import PreProcessor
 # import tracemalloc
 # tracemalloc.start()
 # import objgraph
-import signal
 import time
 
 
 log = logging.getLogger(__name__)
 
 
-def timeout_handler(signum, frame):
-    raise TimeoutError("Function execution timed out")
-
-
 class CallGraphGenerator(object):
-    def __init__(self, entry_points, package, max_iter, operation, no_analyze_external):
+    def __init__(
+        self,
+        entry_points,
+        package,
+        max_iter,
+        operation,
+        no_analyze_external,
+        time_budget=0,
+    ):
         self.entry_points = entry_points
         self.package = package
         self.no_analyze_external = no_analyze_external
         self.state = None
         self.max_iter = max_iter
         self.operation = operation
+        # Wall-clock seconds the iterative phases may spend in total, or 0
+        # for no limit. `analyze` turns it into `self.deadline`.
+        self.time_budget = time_budget or 0
+        self.deadline = None
+        # Set by `_record_incomplete` when a phase runs out of budget; the
+        # FASTEN formatter copies it into the output so a consumer can tell a
+        # converged graph from a fixpoint-in-progress.
+        self.incomplete = None
         self.setUp()
         self.defs_per_module = {}
+
+    def _budget_exhausted(self):
+        return self.deadline is not None and time.monotonic() > self.deadline
+
+    def _record_incomplete(self, phase, iterations):
+        """Note that `phase` stopped early, and say so loudly.
+
+        The graph built so far is kept and written out: every phase bounded
+        here only ever adds names to points-to sets or edges to the graph, so
+        stopping early loses precision (missing edges) and never soundness
+        (no edge that should not be there). This used to be a
+        `signal.alarm(30 * 60)` whose handler called `sys.exit(1)`, which
+        threw the whole analysis away and left the caller with no output file
+        at all.
+        """
+        log.warning(
+            "time budget of %ss exhausted during %s after %d iteration(s); "
+            "the call graph is a sound but less precise "
+            "fixpoint-in-progress and is being written out as is",
+            self.time_budget,
+            phase,
+            iterations,
+        )
+        if self.incomplete is None:
+            self.incomplete = {
+                "phase": phase,
+                "iterations": iterations,
+                "timeBudgetSeconds": self.time_budget,
+                "phasesStopped": [],
+            }
+        self.incomplete["phasesStopped"].append(
+            {"phase": phase, "iterations": iterations}
+        )
 
     def setUp(self):
         self.import_manager = ImportManager()
@@ -142,18 +185,27 @@ class CallGraphGenerator(object):
 
         return input_mod
 
-    def do_pass(self, cls, install_hooks=False, *args, **kwargs):
+    def do_pass(self, cls, install_hooks=False, *args, _budgeted=False, **kwargs):
         modules_analyzed = set()
+        entry_points_done = 0
         # count = 0
         for entry_point in self.entry_points:
+            # A budgeted pass checks the deadline between entry points: one
+            # entry point is one unit of work here, and the passes that opt
+            # in (post-processing) only refine what is already there.
+            if _budgeted and self._budget_exhausted():
+                self._record_incomplete(
+                    "the %s pass (%d of %d entry points)"
+                    % (cls.__name__, entry_points_done, len(self.entry_points)),
+                    entry_points_done,
+                )
+                break
+            entry_points_done += 1
             # m1 = tracemalloc.take_snapshot()
             input_mod = None
             try:
                 # print(entry_point)
                 # old_len_defs = len(self.def_manager.defs)
-                # timeout_duration =  60 *
-                # signal.signal(signal.SIGALRM, timeout_handler)
-                # signal.alarm(timeout_duration)
                 input_pkg = self.package
                 input_mod = self._get_mod_name(entry_point, input_pkg)
                 input_file = os.path.abspath(entry_point)
@@ -187,11 +239,7 @@ class CallGraphGenerator(object):
                     if install_hooks:
                         self.remove_import_hooks()
 
-            # except TimeoutError:
-            #     signal.alarm(0)
-            #     print(f"Pass for {entry_point} timed out after {timeout_duration} seconds.")
             except Exception:
-                # signal.alarm(0)
                 if install_hooks:
                     self.remove_import_hooks()
                 # Recovery is unchanged -- we still move on to the next entry
@@ -214,13 +262,17 @@ class CallGraphGenerator(object):
             # defs_added = new_len_defs - old_len_defs
             # if defs_added > 0:
             #     self.defs_per_module[entry_point] = defs_added
-        # signal.alarm(0)
             # m2 = tracemalloc.take_snapshot()
             # top_stats = m2.compare_to(m1, 'lineno')
             # for stat in top_stats[:2]:
             #     print(stat)
 
     def analyze(self):
+        if self.time_budget > 0:
+            self.deadline = time.monotonic() + self.time_budget
+            log.info(
+                "iterative phases have a time budget of %ss", self.time_budget
+            )
         # objgraph.show_growth(limit=5)
         self.do_pass(
             PreProcessor,
@@ -237,16 +289,21 @@ class CallGraphGenerator(object):
         # self.defs_per_module = {}
         # print(f'Completing definitions, len = {len(self.def_manager.defs)}')
 
-        self.def_manager.complete_definitions(False)
+        sweeps, timed_out = self.def_manager.complete_definitions(
+            False, deadline=self.deadline
+        )
+        if timed_out:
+            self._record_incomplete("the initial complete_definitions", sweeps)
         # objgraph.show_growth(limit=5)
-        # except TimeoutError:
-        #     print("Execution timed out after 0.5 hours")
-        # finally:
-        #     signal.alarm(0)
         iter_cnt = 0
-        while (self.max_iter < 0 or iter_cnt < self.max_iter) and (
-            not self.has_converged()
-        ):
+        while self.max_iter < 0 or iter_cnt < self.max_iter:
+            # The budget is checked before `has_converged`, which rebuilds the
+            # whole state snapshot and is itself expensive on a large package.
+            if self._budget_exhausted():
+                self._record_incomplete("the pointer refinement loop", iter_cnt)
+                break
+            if self.has_converged():
+                break
             # objgraph.show_growth(limit=5)
             self.state = self.extract_state()
             self.reset_counters()
@@ -260,6 +317,7 @@ class CallGraphGenerator(object):
                 self.def_manager,
                 self.class_manager,
                 self.module_manager,
+                _budgeted=True,
             )
             # objgraph.show_growth(limit=5)
 
@@ -267,19 +325,16 @@ class CallGraphGenerator(object):
             # print(f'{self.defs_per_module}')
             self.defs_per_module = {}
 
-            timeout_duration =  60 * 30
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(timeout_duration)
-            try:
-                # print(f'Completing definitions, len = {len(self.def_manager.defs)}')
-                self.def_manager.complete_definitions(self.no_analyze_external)
-            except TimeoutError:
-                # print('TIMEOUT')
-                sys.exit(1)
-                # print(f"Execution timed out after {timeout_duration / 60} minutes.")
-            finally:
-                signal.alarm(0)
+            # print(f'Completing definitions, len = {len(self.def_manager.defs)}')
+            sweeps, timed_out = self.def_manager.complete_definitions(
+                self.no_analyze_external, deadline=self.deadline
+            )
             iter_cnt += 1
+            if timed_out:
+                self._record_incomplete(
+                    "complete_definitions of refinement iteration %d" % iter_cnt,
+                    sweeps,
+                )
 
         self.reset_counters()
         if self.operation == utils.constants.CALL_GRAPH_OP:

@@ -18,6 +18,8 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+import time
+
 from pycg import utils
 from pycg.machinery.pointers import LiteralPointer, NamePointer
 
@@ -111,7 +113,23 @@ class DefinitionManager(object):
 
         return closured
 
-    def complete_definitions(self, no_analyze_external):
+    # How many definitions to walk between two deadline checks. A single
+    # sweep over `self.defs` is minutes long on a package the size of numpy,
+    # so checking only between sweeps would overshoot a time budget by more
+    # than the budget itself.
+    DEADLINE_CHECK_EVERY = 2048
+
+    def complete_definitions(self, no_analyze_external, deadline=None):
+        """Fixpoint over the arguments every definition points to.
+
+        `deadline` is an absolute `time.monotonic()` value or None for no
+        limit. Returns `(sweeps, timed_out)`: the number of sweeps over the
+        definition table that completed, and whether the fixpoint was
+        abandoned because the deadline passed. Points-to sets only ever grow
+        here, so an abandoned fixpoint is a sound under-approximation of the
+        complete one -- fewer names per pointer, never wrong ones -- and the
+        caller can still produce a call graph from it.
+        """
         # THE MOST expensive part of this tool's process
         # TODO: IMPROVE COMPLEXITY
         def update_pointsto_args(pointsto_args, arg, name):
@@ -149,10 +167,20 @@ class DefinitionManager(object):
                     pointsto_arg_def.add(item)
             return changed_something
 
+        sweeps = 0
+        checked = 0
         for i in range(len(self.defs)):
             # print(f'{i}/{len(self.defs)}')
+            if deadline is not None and time.monotonic() > deadline:
+                return sweeps, True
             changed_something = False
             for ns, current_def in self.defs.items():
+                if deadline is not None:
+                    checked += 1
+                    if checked >= self.DEADLINE_CHECK_EVERY:
+                        checked = 0
+                        if time.monotonic() > deadline:
+                            return sweeps, True
                 if no_analyze_external:
                     if current_def.is_ext_def():
                         continue
@@ -189,8 +217,11 @@ class DefinitionManager(object):
                             pointsto_args, arg, current_def.fullns
                         )
 
+            sweeps += 1
             if not changed_something:
                 break
+
+        return sweeps, False
 
 
 class Definition(object):
