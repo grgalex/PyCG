@@ -71,7 +71,7 @@ class TestBase(TestCase):
         main_path = os.path.join(snippet_path, "main.py")
         try:
             cg = self.cg_class(
-                [main_path], snippet_path, -1, utils.constants.CALL_GRAPH_OP
+                [main_path], snippet_path, -1, utils.constants.CALL_GRAPH_OP, False
             )
             cg.analyze()
             return cg.output()
