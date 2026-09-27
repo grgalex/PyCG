@@ -48,16 +48,34 @@ class PreProcessor(ProcessingBase):
         self.class_manager = class_manager
         self.module_manager = module_manager
 
+    @staticmethod
+    def _get_positional_args(node):
+        """Every positional parameter of `node`, in call order.
+
+        PEP 570 splits them in two: `posonlyargs` (everything before the `/`)
+        comes first, then `args`. `ast.arguments.defaults` aligns to the right
+        of the *concatenation* of the two, so any code that walks defaults or
+        positional indices must walk this list, not `node.args.args`.
+        """
+        return list(getattr(node.args, "posonlyargs", None) or []) + list(
+            node.args.args
+        )
+
     def _get_fun_defaults(self, node):
         defaults = {}
-        start = len(node.args.args) - len(node.args.defaults)
+        posargs = self._get_positional_args(node)
+        # `defaults` covers the *last* len(defaults) positional parameters,
+        # positional-only ones included.
+        start = len(posargs) - len(node.args.defaults)
         for cnt, d in enumerate(node.args.defaults, start=start):
             if not d:
                 continue
 
             self.visit(d)
-            defaults[node.args.args[cnt].arg] = self.decode_node(d)
+            defaults[posargs[cnt].arg] = self.decode_node(d)
 
+        # `kw_defaults` is parallel to `kwonlyargs` (None where there is no
+        # default), so this start is always 0; it is kept for symmetry.
         start = len(node.args.kwonlyargs) - len(node.args.kw_defaults)
         for cnt, d in enumerate(node.args.kw_defaults, start=start):
             if not d:
@@ -278,12 +296,14 @@ class PreProcessor(ProcessingBase):
                 ):
                     is_static_method = True
 
+        posargs = self._get_positional_args(node)
+
         if (
             current_def.get_type() == utils.constants.CLS_DEF
             and not is_static_method
-            and node.args.args
+            and posargs
         ):
-            arg_ns = utils.join_ns(fn_def.get_ns(), node.args.args[0].arg)
+            arg_ns = utils.join_ns(fn_def.get_ns(), posargs[0].arg)
             arg_def = self.def_manager.get(arg_ns)
             if not arg_def:
                 arg_def = self.def_manager.create(arg_ns, utils.constants.NAME_DEF)
@@ -292,9 +312,15 @@ class PreProcessor(ProcessingBase):
             self.scope_manager.handle_assign(
                 fn_def.get_ns(), arg_def.get_name(), arg_def
             )
-            node.args.args = node.args.args[1:]
+            # `self` may sit in either list (`def m(self, /, x)` puts it in
+            # posonlyargs); drop it from the one that actually holds it.
+            if getattr(node.args, "posonlyargs", None):
+                node.args.posonlyargs = node.args.posonlyargs[1:]
+            else:
+                node.args.args = node.args.args[1:]
+            posargs = posargs[1:]
 
-        for pos, arg in enumerate(node.args.args):
+        for pos, arg in enumerate(posargs):
             arg_ns = utils.join_ns(fn_def.get_ns(), arg.arg)
             name_pointer.add_pos_arg(pos, arg.arg, arg_ns)
             defs_to_create.append(arg_ns)
