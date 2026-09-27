@@ -177,6 +177,21 @@ class PreProcessor(ProcessingBase):
 
             current_scope = self.scope_manager.get_scope(self.current_ns)
             imported_scope = self.scope_manager.get_scope(modname)
+            if imported_scope is None:
+                # `modname` is in `modules_analyzed` but has no scope yet: it
+                # is still being visited further up the stack (a circular
+                # import), so there is nothing to copy out of it. Falling
+                # through would raise AttributeError and cost the *importing*
+                # module every definition it has -- which is how PyMuPDF's
+                # `pymupdf` and `pymupdf.mupdf` (9187 defs) used to vanish.
+                if tgt_name != "*":
+                    defi = self.def_manager.get(imp_name)
+                    if defi:
+                        create_def(current_scope, tgt_name, defi)
+                        current_scope.get_def(tgt_name).get_name_pointer().add(
+                            defi.get_ns()
+                        )
+                return
             if tgt_name == "*":
                 for name, defi in imported_scope.get_defs().items():
                     create_def(current_scope, name, defi)
