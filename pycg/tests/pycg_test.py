@@ -25,6 +25,7 @@ import tempfile
 from base import TestBase
 
 from pycg import utils
+from pycg.formats import Fasten
 from pycg.processing.preprocessor import PreProcessor
 from pycg.pycg import CallGraphGenerator
 
@@ -86,3 +87,89 @@ class DoPassFailureTest(TestBase):
         self.assertIn("boom", message)  # names the module that was lost
         self.assertIn("kaboom", message)  # carries the traceback
         self.assertIn("Traceback", message)
+
+
+class TimeBudgetTest(TestBase):
+    """A slow package must still produce a call graph.
+
+    `CallGraphGenerator.analyze` used to wrap `complete_definitions` in
+    `signal.alarm(60 * 30)` whose handler called `sys.exit(1)`. A package
+    whose pointer fixpoint took longer than half an hour therefore produced
+    no output at all -- not a coarser graph, nothing -- and the caller saw
+    only a missing file and a non-zero exit code. The budget replaces it:
+    the iterative phases stop iterating, say so, and the graph built so far
+    is written out.
+    """
+
+    SNIPPET = "\n".join(
+        [
+            "def callee():",
+            "    pass",
+            "",
+            "",
+            "def caller():",
+            "    callee()",
+            "",
+            "",
+            "caller()",
+            "",
+        ]
+    )
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, "mod.py")
+        with open(self.path, "w") as f:
+            f.write(self.SNIPPET)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _generate(self, **kwargs):
+        cg = CallGraphGenerator(
+            [self.path], self.tmpdir, -1, utils.constants.CALL_GRAPH_OP, False,
+            **kwargs
+        )
+        return cg
+
+    def _fasten(self, cg):
+        return Fasten(cg, self.tmpdir, "prod", "PyPI", "1.0", 0).generate()
+
+    def test_no_budget_runs_to_completion(self):
+        cg = self._generate()
+        cg.analyze()
+        self.assertIsNone(cg.incomplete)
+        self.assertIn("mod.caller", cg.output())
+        self.assertIn("mod.callee", cg.output()["mod.caller"])
+        self.assertNotIn("incomplete", self._fasten(cg))
+
+    def test_exhausted_budget_still_outputs_and_is_recorded(self):
+        # A deadline already in the past when the first iterative phase is
+        # reached: every one of them must bail out on its first check.
+        cg = self._generate(time_budget=1e-9)
+
+        with self.assertLogs("pycg.pycg", level="WARNING") as ctx:
+            cg.analyze()
+
+        message = "\n".join(ctx.output)
+        self.assertIn("time budget", message)
+        self.assertIn("fixpoint-in-progress", message)
+
+        self.assertIsNotNone(cg.incomplete)
+        self.assertIn("complete_definitions", cg.incomplete["phase"])
+        self.assertEqual(cg.incomplete["iterations"], 0)
+        self.assertEqual(cg.incomplete["timeBudgetSeconds"], 1e-9)
+        self.assertTrue(cg.incomplete["phasesStopped"])
+
+        # The whole point: there is still a call graph, and it is still the
+        # output of a normal run -- nothing was thrown away.
+        output = self._fasten(cg)
+        self.assertEqual(output["incomplete"], cg.incomplete)
+        self.assertTrue(output["modules"]["internal"])
+        self.assertTrue(output["graph"]["internalCalls"])
+
+    def test_generous_budget_is_not_hit(self):
+        cg = self._generate(time_budget=600)
+        cg.analyze()
+        self.assertIsNone(cg.incomplete)
+        self.assertNotIn("incomplete", self._fasten(cg))

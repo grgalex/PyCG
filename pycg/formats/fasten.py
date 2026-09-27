@@ -258,7 +258,7 @@ class Fasten(BaseFormatter):
         return graph
 
     def generate(self):
-        return {
+        res = {
             "product": self.product,
             "forge": self.forge,
             "generator": "PyCG",
@@ -272,3 +272,9 @@ class Fasten(BaseFormatter):
             "graph": self.get_graph(),
             "nodes": self.get_unique_and_increment(),
         }
+        # Only present when a phase ran out of its time budget, so a consumer
+        # that never sets one sees byte-identical output to before.
+        incomplete = getattr(self.cg_generator, "incomplete", None)
+        if incomplete:
+            res["incomplete"] = incomplete
+        return res
