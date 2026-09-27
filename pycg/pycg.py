@@ -18,8 +18,10 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+import logging
 import os
 import sys
+import traceback
 
 from pycg import utils
 from pycg.machinery.callgraph import CallGraph
@@ -38,6 +40,9 @@ from pycg.processing.preprocessor import PreProcessor
 # import objgraph
 import signal
 import time
+
+
+log = logging.getLogger(__name__)
 
 
 def timeout_handler(signum, frame):
@@ -142,6 +147,7 @@ class CallGraphGenerator(object):
         # count = 0
         for entry_point in self.entry_points:
             # m1 = tracemalloc.take_snapshot()
+            input_mod = None
             try:
                 # print(entry_point)
                 # old_len_defs = len(self.def_manager.defs)
@@ -184,10 +190,26 @@ class CallGraphGenerator(object):
             # except TimeoutError:
             #     signal.alarm(0)
             #     print(f"Pass for {entry_point} timed out after {timeout_duration} seconds.")
-            except Exception as e:
+            except Exception:
                 # signal.alarm(0)
                 if install_hooks:
                     self.remove_import_hooks()
+                # Recovery is unchanged -- we still move on to the next entry
+                # point -- but the failure is no longer silent. Whatever the
+                # processor had not reached yet is simply missing from the
+                # call graph, and `input_mod` was already added to
+                # `modules_analyzed` by ProcessingBase.__init__, so the module
+                # is never revisited: without this warning a module could end
+                # up in the output holding nothing but its own namespace and
+                # nobody would know.
+                log.warning(
+                    "%s pass failed for entry point %s (module %r); its "
+                    "definitions are missing from the call graph:\n%s",
+                    cls.__name__,
+                    entry_point,
+                    input_mod,
+                    traceback.format_exc(),
+                )
             # new_len_defs = len(self.def_manager.defs)
             # defs_added = new_len_defs - old_len_defs
             # if defs_added > 0:
