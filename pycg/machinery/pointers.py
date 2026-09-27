@@ -19,20 +19,37 @@
 # under the License.
 #
 class Pointer(object):
+    # Bumped by every change to any pointer's value set. A definition's
+    # transitive closure is a pure function of those sets plus the definition
+    # table, so `DefinitionManager.transitive_closure` uses this counter
+    # (together with its own) to tell when its cached answer is still valid.
+    # A counter rather than a dirty flag because the closure is rebuilt by
+    # many objects, none of which owns the cache.
+    version = 0
+
     def __init__(self):
         self.values = set()
 
     def add(self, item):
+        before = len(self.values)
         self.values.add(item)
+        if len(self.values) != before:
+            Pointer.version += 1
 
     def add_set(self, s):
+        before = len(self.values)
         self.values = self.values.union(s)
+        if len(self.values) != before:
+            Pointer.version += 1
 
     def get(self):
         return self.values
 
     def merge(self, pointer):
+        before = len(self.values)
         self.values = self.values.union(pointer.values)
+        if len(self.values) != before:
+            Pointer.version += 1
 
 
 class LiteralPointer(Pointer):
@@ -43,11 +60,11 @@ class LiteralPointer(Pointer):
     # no need to add the actual item
     def add(self, item):
         if isinstance(item, str):
-            self.values.add(item)
+            super().add(item)
         elif isinstance(item, int):
-            self.values.add(item)
+            super().add(item)
         else:
-            self.values.add(self.UNK_LIT)
+            super().add(self.UNK_LIT)
 
 
 class NamePointer(Pointer):
