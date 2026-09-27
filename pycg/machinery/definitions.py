@@ -21,12 +21,18 @@
 import time
 
 from pycg import utils
-from pycg.machinery.pointers import LiteralPointer, NamePointer
+from pycg.machinery.pointers import LiteralPointer, NamePointer, Pointer
 
 
 class DefinitionManager(object):
     def __init__(self):
         self.defs = {}
+        # Bumped whenever a definition is created or replaced -- `assign`
+        # throws away the old definition's pointers, which can shrink the
+        # closure, so the count of definitions is not enough on its own.
+        self._version = 0
+        self._closure_key = None
+        self._closure_cache = None
 
     def create(self, ns, def_type):
         if not ns or not isinstance(ns, str):
@@ -37,16 +43,19 @@ class DefinitionManager(object):
             raise DefinitionError("Definition already exists")
 
         self.defs[ns] = Definition(ns, def_type)
+        self._version += 1
         return self.defs[ns]
 
     def assign(self, ns, defi):
         self.defs[ns] = Definition(ns, defi.get_type())
+        self._version += 1
         self.defs[ns].merge(defi)
 
         # if it is a function def, we need to create a return pointer
         if defi.is_function_def():
             return_ns = utils.join_ns(ns, utils.constants.RETURN_NAME)
             self.defs[return_ns] = Definition(return_ns, utils.constants.NAME_DEF)
+            self._version += 1
             self.defs[return_ns].get_name_pointer().add(
                 utils.join_ns(defi.get_ns(), utils.constants.RETURN_NAME)
             )
@@ -82,35 +91,52 @@ class DefinitionManager(object):
         return defi
 
     def transitive_closure(self):
+        """What every definition can ultimately point to, for every definition.
+
+        Pure in the definition table and its name pointers, and cached on
+        exactly that: every `PostProcessor` and `CallGraphProcessor` rebuilt
+        it in its constructor, which is once per module per pass over the
+        *whole package*, so the cost grew with modules times definitions.
+        On pillow that single call was 74% of the run.
+        """
+        key = (self._version, Pointer.version)
+        if self._closure_key == key:
+            return self._closure_cache
+
         closured = {}
+        defs = self.defs
 
         def dfs(defi):
-            name_pointer = defi.get_name_pointer()
-            new_set = set()
+            ns = defi.fullns
             # bottom
-            if closured.get(defi.get_ns(), None) is not None:
-                return closured[defi.get_ns()]
+            if closured.get(ns, None) is not None:
+                return closured[ns]
 
-            if not name_pointer.get():
-                new_set.add(defi.get_ns())
+            names = defi.points_to["name"].values
+            new_set = set()
+            if not names:
+                new_set.add(ns)
 
-            closured[defi.get_ns()] = new_set
+            closured[ns] = new_set
 
-            for name in name_pointer.get():
-                if not self.defs.get(name, None):
+            for name in names:
+                pointed = defs.get(name, None)
+                if not pointed:
                     continue
-                items = dfs(self.defs[name])
+                items = dfs(pointed)
                 if not items:
                     items = set([name])
                 new_set = new_set.union(items)
 
-            closured[defi.get_ns()] = new_set
-            return closured[defi.get_ns()]
+            closured[ns] = new_set
+            return closured[ns]
 
-        for ns, current_def in self.defs.items():
+        for ns, current_def in defs.items():
             if closured.get(current_def, None) is None:
                 dfs(current_def)
 
+        self._closure_key = key
+        self._closure_cache = closured
         return closured
 
     # How many definitions to walk between two deadline checks. A single
