@@ -162,14 +162,14 @@ class Fasten(BaseFormatter):
     def get_internal_modules(self):
         mods = {}
 
-        for modname, module in self.internal_mods.items():
+        for modname, module in sorted(self.internal_mods.items()):
             name = self.to_uri(modname)
             filename = module["filename"]
             namespaces = module["methods"]
 
             mods[name] = {"sourceFile": filename, "namespaces": {}}
 
-            for namespace, info in namespaces.items():
+            for namespace, info in sorted(namespaces.items()):
                 namespace_uri = self.to_uri(modname, info["name"])
 
                 unique = self.get_unique_and_increment()
@@ -216,13 +216,13 @@ class Fasten(BaseFormatter):
 
     def get_external_modules(self):
         mods = {}
-        for modname, module in self.external_mods.items():
+        for modname, module in sorted(self.external_mods.items()):
             name = self.to_external_uri(modname).split("/")[2]
             namespaces = module["methods"]
 
             mods[name] = {"sourceFile": "", "namespaces": {}}
 
-            for namespace, info in namespaces.items():
+            for namespace, info in sorted(namespaces.items()):
                 # We avoid saving the external module as external method
                 if info["name"] != modname:
                     namespace_uri = self.to_external_uri(modname, info["name"])
@@ -239,7 +239,9 @@ class Fasten(BaseFormatter):
 
         internal, external = self.create_namespaces_map()
 
-        for src, dst in self.edges:
+        # Edges come out of sets: without a sort the same input gives a
+        # different file under every PYTHONHASHSEED.
+        for src, dst in sorted(self.edges):
             uris = []
             for node in [src, dst]:
                 if node in internal:
