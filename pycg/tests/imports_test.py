@@ -22,7 +22,10 @@ import copy
 import os
 import sys
 
-import mock
+try:
+    import mock
+except ImportError:
+    from unittest import mock
 from base import TestBase
 
 from pycg.machinery.imports import ImportManager, ImportManagerError, get_custom_loader

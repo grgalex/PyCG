@@ -21,7 +21,10 @@
 import symtable
 
 from base import TestBase
-from mock import patch
+try:
+    from mock import patch
+except ImportError:
+    from unittest.mock import patch
 
 from pycg.machinery.scopes import ScopeError, ScopeItem, ScopeManager
 
