@@ -165,7 +165,7 @@ class PreProcessor(ProcessingBase):
                 src_name = prefix + "." + src_name
             return src_name
 
-        def handle_scopes(imp_name, tgt_name, modname):
+        def handle_scopes(imp_name, tgt_name, modname, is_module=False):
             def create_def(scope, name, imported_def):
                 if name not in scope.get_defs():
                     def_ns = utils.join_ns(scope.get_ns(), name)
@@ -196,6 +196,18 @@ class PreProcessor(ProcessingBase):
                 for name, defi in imported_scope.get_defs().items():
                     create_def(current_scope, name, defi)
                     current_scope.get_def(name).get_name_pointer().add(defi.get_ns())
+            elif is_module:
+                # `from pkg import Image` names the module `pkg.Image`, not
+                # a same-named class or function defined inside it; the
+                # module's root scope holds both under `Image` and the
+                # inner one used to win, so `Image.register_open()` in a
+                # plugin resolved against the class and found nothing.
+                defi = self.def_manager.get(modname)
+                if defi:
+                    create_def(current_scope, tgt_name, defi)
+                    current_scope.get_def(tgt_name).get_name_pointer().add(
+                        defi.get_ns()
+                    )
             else:
                 # if it exists in the imported scope then copy it
                 defi = imported_scope.get_def(imp_name)
@@ -250,7 +262,12 @@ class PreProcessor(ProcessingBase):
             if self.import_manager.get_mod_dir() in fname:
                 if imported_name not in self.modules_analyzed:
                     self.analyze_submodule(imported_name)
-                handle_scopes(import_item.name, tgt_name, imported_name)
+                # `from . import Image` has no `module` but a level.
+                is_module = (bool(prefix) or level > 0) and (
+                    imported_name == src_name
+                    or imported_name.endswith("." + import_item.name)
+                )
+                handle_scopes(import_item.name, tgt_name, imported_name, is_module)
             else:
                 add_external_def(src_name, tgt_name)
 
