@@ -220,7 +220,9 @@ class Fasten(BaseFormatter):
             name = self.to_external_uri(modname).split("/")[2]
             namespaces = module["methods"]
 
-            mods[name] = {"sourceFile": "", "namespaces": {}}
+            mods[name] = {"sourceFile": module.get("filename") or "", "namespaces": {}}
+            if module.get("metadata"):
+                mods[name]["metadata"] = module["metadata"]
 
             for namespace, info in sorted(namespaces.items()):
                 # We avoid saving the external module as external method
@@ -229,7 +231,7 @@ class Fasten(BaseFormatter):
 
                     unique = self.get_unique_and_increment()
                     mods[name]["namespaces"][str(unique)] = dict(
-                        namespace=namespace_uri, metadata={}
+                        namespace=namespace_uri, metadata=info.get("metadata") or {}
                     )
                     self.namespace_map[namespace_uri] = unique
         return mods

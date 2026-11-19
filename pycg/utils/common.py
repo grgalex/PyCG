@@ -42,4 +42,12 @@ def join_ns(*args):
 
 
 def to_mod_name(name, package=None):
-    return os.path.splitext(name)[0].replace("/", ".")
+    # An extension module's file name carries the whole ABI tag
+    # (`_ext.cpython-311-x86_64-linux-gnu.so`); splitext would leave
+    # `_ext.cpython-311-x86_64-linux-gnu` and that is not a module name.
+    from pycg.machinery.native import strip_extension_suffix
+
+    stem = strip_extension_suffix(name)
+    if stem is None:
+        stem = os.path.splitext(name)[0]
+    return stem.replace("/", ".")

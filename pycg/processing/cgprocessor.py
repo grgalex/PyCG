@@ -22,6 +22,7 @@ import ast
 import os
 
 from pycg import utils
+from pycg.machinery import native
 from pycg.machinery.definitions import Definition
 from pycg.processing.base import ProcessingBase
 
@@ -37,6 +38,7 @@ class CallGraphProcessor(ProcessingBase):
         class_manager,
         module_manager,
         call_graph=None,
+        native_registry=None,
         modules_analyzed=None,
     ):
         super().__init__(filename, modname, modules_analyzed)
@@ -50,6 +52,7 @@ class CallGraphProcessor(ProcessingBase):
         self.module_manager = module_manager
 
         self.call_graph = call_graph
+        self.native = native_registry
 
         self.closured = self.def_manager.transitive_closure()
 
@@ -123,9 +126,87 @@ class CallGraphProcessor(ProcessingBase):
         )
         super().visit_FunctionDef(node)
 
+    # ---- native code -------------------------------------------------------
+
+    def visit_Import(self, node):
+        self._import_edges(node)
+
+    def visit_ImportFrom(self, node):
+        self._import_edges(node)
+
+    def _import_edges(self, node):
+        """An import is a call of the imported module's body."""
+        if self.native is None:
+            return
+        for dotted in self.native.import_sites.get((self.modname, node.lineno), ()):
+            self._module_edge(dotted)
+
+    def _module_edge(self, dotted):
+        if dotted in self.native.extension_modules:
+            self._compiled_module(dotted)
+        elif not self.def_manager.get(dotted):
+            return
+        self.call_graph.add_node(dotted, dotted)
+        self.call_graph.add_edge(self.current_method, dotted)
+
+    def _compiled_module(self, dotted):
+        """A compiled module of the package is an internal module whose
+        file is the binary and whose namespaces carry no line numbers:
+        the consumer resolves them against the file."""
+        mod = self.module_manager.get(dotted)
+        if not mod:
+            mod = self.module_manager.create(dotted, self.native.extension_modules[dotted])
+            mod.add_method(dotted)
+        return mod
+
+    def _ext_node(self, name, ext_modname, metadata=None):
+        """Register `name` under external module `ext_modname`."""
+        ext_mod = self.module_manager.get(ext_modname)
+        if not ext_mod:
+            ext_mod = self.module_manager.create(ext_modname, None, external=True)
+            ext_mod.add_method(ext_modname)
+        ext_mod.add_method(name, metadata=metadata)
+
+    def _callee_module(self, name):
+        """The module a callee name belongs to: a compiled module of the
+        package when the name is under one, else the first component."""
+        if self.native is not None:
+            dotted = self.native.extension_module_of(name)
+            if dotted:
+                return dotted, True
+        return name.split(".")[0], False
+
+    def _dynamic_import_edges(self, node, names):
+        """`importlib.import_module("pkg.mod")` is an import too."""
+        if self.native is None or not names & native.DYNAMIC_IMPORTERS:
+            return
+        if not node.args or not isinstance(node.args[0], ast.Constant):
+            return
+        dotted = node.args[0].value
+        if not isinstance(dotted, str):
+            return
+        if dotted.startswith("."):
+            pkg = None
+            for kw in node.keywords:
+                if kw.arg == "package" and isinstance(kw.value, ast.Constant):
+                    pkg = kw.value.value
+            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                pkg = node.args[1].value
+            if not isinstance(pkg, str):
+                return
+            dotted = pkg + dotted if dotted.count(".") == 1 else pkg.rsplit(".", dotted.count(".") - 1)[0] + "." + dotted.lstrip(".")
+        self.native.find_extension_module(dotted)
+        self._module_edge(dotted)
+
     def visit_Call(self, node):
         def create_ext_edge(name, ext_modname):
-            self.add_ext_mod_node(name)
+            ext_modname, compiled = self._callee_module(name)
+            if compiled:
+                # an attribute of the package's own compiled module: an
+                # internal namespace without lines, under that module
+                self._compiled_module(ext_modname).add_method(name)
+            else:
+                self._ext_node(name, ext_modname)
             self.call_graph.add_node(name, ext_modname)
             self.call_graph.add_edge(self.current_method, name)
 
@@ -141,6 +222,12 @@ class CallGraphProcessor(ProcessingBase):
         self.visit(node.func)
 
         names = self.retrieve_call_names(node)
+        if names:
+            self._dynamic_import_edges(node, names)
+        elif isinstance(node.func, ast.Name):
+            self._dynamic_import_edges(
+                node, {utils.join_ns(utils.constants.BUILTIN_NAME, node.func.id)}
+            )
         if not names:
             if isinstance(node.func, ast.Attribute) and self.has_ext_parent(node.func):
                 # TODO: This doesn't work for cases
@@ -192,6 +279,7 @@ class CallGraphProcessor(ProcessingBase):
             self.class_manager,
             self.module_manager,
             call_graph=self.call_graph,
+            native_registry=self.native,
             modules_analyzed=self.get_modules_analyzed(),
         )
 

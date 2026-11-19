@@ -227,7 +227,13 @@ class ImportManager(object):
         self.old_path_hooks = copy.deepcopy(sys.path_hooks)
         self.old_path = copy.deepcopy(sys.path)
 
-        loader_details = loader, importlib.machinery.all_suffixes()
+        # The package may ship extensions built for another interpreter
+        # (a cp311 wheel analysed from 3.10): their suffixes are not in
+        # all_suffixes(), and without them `from . import _ext` silently
+        # becomes an external import of a bare `_ext`.
+        from pycg.machinery.native import extension_suffixes_in
+
+        loader_details = loader, extension_suffixes_in(self.mod_dir)
         sys.path_hooks.insert(
             0, importlib.machinery.FileFinder.path_hook(loader_details)
         )

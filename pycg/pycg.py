@@ -30,6 +30,7 @@ from pycg.machinery.imports import ImportManager
 from pycg.machinery.key_err import KeyErrors
 from pycg.machinery.modules import ModuleManager
 from pycg.machinery.scopes import ScopeManager
+from pycg.machinery.native import NativeRegistry
 from pycg.processing.cgprocessor import CallGraphProcessor
 from pycg.processing.keyerrprocessor import KeyErrProcessor
 from pycg.processing.postprocessor import PostProcessor
@@ -111,6 +112,7 @@ class CallGraphGenerator(object):
         self.module_manager = ModuleManager()
         self.cg = CallGraph()
         self.key_errs = KeyErrors()
+        self.native = NativeRegistry(self.package)
 
     def extract_state(self):
         state = {}
@@ -282,6 +284,7 @@ class CallGraphGenerator(object):
             self.def_manager,
             self.class_manager,
             self.module_manager,
+            self.native,
         )
         # objgraph.show_growth(limit=5)
         # self.defs_per_module = dict(sorted(self.defs_per_module.items(), key=lambda item: item[1]))
@@ -347,6 +350,7 @@ class CallGraphGenerator(object):
                 self.class_manager,
                 self.module_manager,
                 call_graph=self.cg,
+                native_registry=self.native,
             )
         elif self.operation == utils.constants.KEY_ERR_OP:
             self.do_pass(
@@ -377,14 +381,15 @@ class CallGraphGenerator(object):
     def _generate_mods(self, mods):
         res = {}
         for mod, node in mods.items():
+            filename = node.get_filename()
+            if filename and os.path.isabs(filename) and self.package:
+                filename = os.path.relpath(filename, self.package)
             res[mod] = {
-                "filename": (
-                    os.path.relpath(node.get_filename(), self.package)
-                    if node.get_filename()
-                    else None
-                ),
+                "filename": filename or None,
                 "methods": node.get_methods(),
             }
+            if getattr(node, "metadata", None):
+                res[mod]["metadata"] = node.metadata
         return res
 
     def output_internal_mods(self):

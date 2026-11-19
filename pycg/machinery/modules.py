@@ -49,6 +49,7 @@ class Module:
         self.name = name
         self.filename = filename
         self.methods = dict()
+        self.metadata = None
 
     def get_name(self):
         return self.name
@@ -59,6 +60,14 @@ class Module:
     def get_methods(self):
         return self.methods
 
-    def add_method(self, method, first=None, last=None):
+    def add_method(self, method, first=None, last=None, metadata=None):
         if not self.methods.get(method, None):
             self.methods[method] = dict(name=method, first=first, last=last)
+        if metadata:
+            self.methods[method].setdefault("metadata", {}).update(metadata)
+
+    def set_metadata(self, metadata):
+        self.metadata = dict(metadata)
+
+    def set_filename(self, filename):
+        self.filename = filename

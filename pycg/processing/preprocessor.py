@@ -21,6 +21,7 @@
 import ast
 
 from pycg import utils
+from pycg.machinery import native
 from pycg.machinery.definitions import Definition
 from pycg.processing.base import ProcessingBase
 
@@ -35,6 +36,7 @@ class PreProcessor(ProcessingBase):
         def_manager,
         class_manager,
         module_manager,
+        native_registry=None,
         modules_analyzed=None,
     ):
         super().__init__(filename, modname, modules_analyzed)
@@ -47,6 +49,7 @@ class PreProcessor(ProcessingBase):
         self.def_manager = def_manager
         self.class_manager = class_manager
         self.module_manager = module_manager
+        self.native = native_registry
 
     @staticmethod
     def _get_positional_args(node):
@@ -94,6 +97,7 @@ class PreProcessor(ProcessingBase):
             self.def_manager,
             self.class_manager,
             self.module_manager,
+            self.native,
             modules_analyzed=self.get_modules_analyzed(),
         )
 
@@ -245,6 +249,58 @@ class PreProcessor(ProcessingBase):
                 tgt_defi.get_name_pointer().add(defi.get_ns())
                 scope.add_def(target, tgt_defi)
 
+        def bind_extension_import(import_item, src_name, tgt_name, imported_name, fname):
+            # `imported_name` is a compiled module shipped in the package:
+            # there is no source to analyse. Record the file and the import
+            # site for the call-graph pass, and bind the imported names to
+            # EXTERNALDEFs under the module's real dotted name, so
+            # `core.blend()` resolves to `pkg._ext.blend` and not to a bare
+            # `_ext`. What the file is (an extension with a PyInit_) is for
+            # the consumer to decide from the file.
+            if self.native is not None:
+                self.native.add_extension_module(imported_name, fname)
+                self.native.add_import_site(self.modname, node.lineno, imported_name)
+            mod_def = self.def_manager.get(imported_name)
+            if not mod_def:
+                mod_def = self.def_manager.create(imported_name, utils.constants.EXT_DEF)
+            scope = self.scope_manager.get_scope(self.current_ns)
+            if tgt_name == "*":
+                return
+            is_from = bool(prefix) or level > 0
+            names_module = (
+                imported_name == src_name
+                or imported_name.endswith("." + import_item.name)
+            )
+            if is_from and not names_module:
+                # from pkg._ext import f  -> f is an attribute of the module
+                attr = src_name[len(imported_name) + 1 :] if src_name.startswith(imported_name + ".") else import_item.name
+                target_def = self.def_manager.get(utils.join_ns(imported_name, attr))
+                if not target_def:
+                    target_def = self.def_manager.create(
+                        utils.join_ns(imported_name, attr), utils.constants.EXT_DEF
+                    )
+            elif is_from or import_item.asname:
+                # from . import _ext as core / import pkg._ext as e
+                target_def = mod_def
+            else:
+                # import pkg._ext -> binds `pkg`
+                tgt_name = src_name.split(".")[0]
+                target_def = self.def_manager.get(tgt_name)
+                if not target_def:
+                    target_def = self.def_manager.create(tgt_name, utils.constants.EXT_DEF)
+            tgt_ns = utils.join_ns(scope.get_ns(), tgt_name)
+            if tgt_ns == target_def.get_ns():
+                # `from . import _ext` inside pkg/__init__.py binds
+                # `pkg._ext`, which *is* the module: no alias def, or it
+                # would point at itself and close to nothing.
+                scope.add_def(tgt_name, target_def)
+                return
+            tgt_def = self.def_manager.get(tgt_ns)
+            if not tgt_def:
+                tgt_def = self.def_manager.create(tgt_ns, utils.constants.EXT_DEF)
+            tgt_def.get_name_pointer().add(target_def.get_ns())
+            scope.add_def(tgt_name, tgt_def)
+
         for import_item in node.names:
             src_name = handle_src_name(import_item.name)
             tgt_name = import_item.asname if import_item.asname else import_item.name
@@ -258,8 +314,18 @@ class PreProcessor(ProcessingBase):
             if not fname:
                 add_external_def(src_name, tgt_name)
                 continue
+            if (
+                self.import_manager.get_mod_dir() in fname
+                and native.is_extension_file(fname)
+            ):
+                bind_extension_import(import_item, src_name, tgt_name, imported_name, fname)
+                continue
             # only analyze modules under the current directory
             if self.import_manager.get_mod_dir() in fname:
+                if self.native is not None:
+                    # an import runs the module body: an edge in the call
+                    # graph, for Python and compiled modules alike
+                    self.native.add_import_site(self.modname, node.lineno, imported_name)
                 if imported_name not in self.modules_analyzed:
                     self.analyze_submodule(imported_name)
                 # `from . import Image` has no `module` but a level.
