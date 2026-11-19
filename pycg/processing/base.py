@@ -352,7 +352,20 @@ class ProcessingBase(ast.NodeVisitor):
                     utils.constants.FUN_DEF,
                     utils.constants.MOD_DEF,
                 ]:
-                    names.add(utils.join_ns(name, node.attr))
+                    attr_ns = utils.join_ns(name, node.attr)
+                    attr_def = self.def_manager.get(attr_ns)
+                    # `pkg.fast_sum` bound by `from .core._speedups import
+                    # fast_sum` is an alias: the callee is what it points
+                    # at, not the alias itself.
+                    if (
+                        attr_def
+                        and attr_def.get_type() == utils.constants.EXT_DEF
+                        and self.closured.get(attr_ns)
+                        and self.closured.get(attr_ns) != {attr_ns}
+                    ):
+                        names = names.union(self.closured.get(attr_ns))
+                    else:
+                        names.add(attr_ns)
                 if defi.get_type() == utils.constants.EXT_DEF:
                     # HACK: extenral attributes can lead to infinite loops
                     # Identify them here
