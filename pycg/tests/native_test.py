@@ -18,7 +18,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-"""Native code reached from Python: compiled-module imports."""
+"""Native code reached from Python: compiled-module imports and dlopen."""
 import glob
 import os
 import shutil
@@ -218,6 +218,154 @@ class CompiledModuleTest(NativeTestBase):
         doc = self.fasten(cg)
         self.assertIn("/pkg._rust/", doc["modules"]["internal"])
         self.assertNotIn("/pkg._rust.openssl/", doc["modules"]["internal"])
+
+
+class DynamicLoadTest(NativeTestBase):
+    def test_loaders_and_library_name_forms(self):
+        self.write("pkg/__init__.py")
+        self.write("pkg/libfoo.so")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import ctypes, ctypes.util, os",
+                    "from ctypes import CDLL",
+                    "import cffi",
+                    "_LIB = 'libbar.so'",
+                    "a = ctypes.CDLL('foo')",
+                    "b = CDLL(ctypes.util.find_library('m'))",
+                    "c = ctypes.cdll.LoadLibrary(os.path.join(os.path.dirname(__file__), 'libfoo.so'))",
+                    "d = ctypes.PyDLL(_LIB)",
+                    "ffi = cffi.FFI()",
+                    "e = ffi.dlopen('libbaz.so.1')",
+                    "",
+                    "def use():",
+                    "    a.fa()",
+                    "    b.fb()",
+                    "    c.fc()",
+                    "    d.fd()",
+                    "    e.fe()",
+                    "    ctypes.CDLL('libx.so').fx()",
+                    "",
+                ]
+            ),
+        )
+        cg = self.generate()
+        edges = self.edges(cg)
+        for lib, sym in (("foo", "fa"), ("m", "fb"), ("libfoo.so", "fc"), ("libbar.so", "fd"), ("libbaz.so.1", "fe"), ("libx.so", "fx")):
+            self.assertIn(("pkg.mod.use", "dlopen:%s.%s" % (lib, sym)), edges)
+        # the loader itself is not a callee any more
+        self.assertFalse(any(dst.startswith("ctypes.CDLL.") for _, dst in edges))
+
+        doc = self.fasten(cg)
+        loads = {(l["namespace"], l["line"]): l for l in doc["dynamicLoads"]}
+        self.assertEqual(loads[("pkg.mod", 5)]["resolution"], "literal")
+        self.assertEqual(loads[("pkg.mod", 6)]["resolution"], "find_library")
+        self.assertEqual(loads[("pkg.mod", 7)]["resolution"], "path-join")
+        self.assertEqual(loads[("pkg.mod", 7)]["file"], "pkg/libfoo.so")
+        self.assertEqual(loads[("pkg.mod", 8)]["resolution"], "name-constant")
+        self.assertEqual(loads[("pkg.mod", 10)]["loader"], "cffi.FFI.dlopen")
+        self.assertEqual(loads[("pkg.mod.use", 18)]["library"], "libx.so")
+        mod = doc["modules"]["external"]["dlopen:libfoo.so"]
+        self.assertEqual(mod["sourceFile"], "pkg/libfoo.so")
+        self.assertEqual(mod["metadata"]["kind"], "dynamic-library")
+        self.assertEqual(mod["metadata"]["loaders"], ["ctypes.cdll.LoadLibrary"])
+        self.assertEqual(self.external(doc, "dlopen:foo")["dlopen:foo.fa"], {"kind": "dynamic-symbol", "symbol": "fa"})
+
+    def test_handles_follow_aliases_parameters_and_attributes(self):
+        self.write("pkg/__init__.py")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import ctypes",
+                    "x = ctypes.CDLL('libfoo.so')",
+                    "lib = x",
+                    "",
+                    "def call_it(l):",
+                    "    l.foo_param()",
+                    "",
+                    "call_it(lib)",
+                    "",
+                    "class W:",
+                    "    _lib = x",
+                    "    def run(self):",
+                    "        return self._lib.foo_method()",
+                    "",
+                ]
+            ),
+        )
+        edges = self.edges(self.generate())
+        self.assertIn(("pkg.mod.call_it", "dlopen:libfoo.so.foo_param"), edges)
+        self.assertIn(("pkg.mod.W.run", "dlopen:libfoo.so.foo_method"), edges)
+
+    def test_wrappers_around_loaders_are_loaders(self):
+        self.write("pkg/__init__.py")
+        self.write("pkg/sub/__init__.py")
+        self.write("pkg/sub/_raw_x.abi3.so")
+        self.write(
+            "pkg/_raw_api.py",
+            "\n".join(
+                [
+                    "import os",
+                    "from cffi import FFI",
+                    "ffi = FFI()",
+                    "",
+                    "def load_lib(name, cdecl):",
+                    "    lib = ffi.dlopen(name)",
+                    "    ffi.cdef(cdecl)",
+                    "    return lib",
+                    "",
+                    "def load_raw(name, cdecl):",
+                    "    split = name.split('.')",
+                    "    full_name = os.path.join('/x', *split[:-1], split[-1] + '.abi3.so')",
+                    "    return load_lib(full_name, cdecl)",
+                    "",
+                ]
+            ),
+        )
+        self.write(
+            "pkg/sub/x.py",
+            "\n".join(
+                [
+                    "from pkg._raw_api import load_raw",
+                    "_raw_x = load_raw('pkg.sub._raw_x', 'int x_run(int);')",
+                    "",
+                    "def run(v):",
+                    "    return _raw_x.x_run(v)",
+                    "",
+                ]
+            ),
+        )
+        cg = self.generate()
+        self.assertIn(("pkg.sub.x.run", "dlopen:pkg.sub._raw_x.x_run"), self.edges(cg))
+        doc = self.fasten(cg)
+        site = [l for l in doc["dynamicLoads"] if l["namespace"] == "pkg.sub.x"][0]
+        self.assertEqual(site["loader"], "cffi.FFI.dlopen")
+        self.assertEqual(site["via"], ["pkg._raw_api.load_raw", "pkg._raw_api.load_lib"])
+        self.assertEqual(site["file"], "pkg/sub/_raw_x.abi3.so")
+        self.assertEqual(site["resolution"], "argument")
+        body = [l for l in doc["dynamicLoads"] if l["namespace"] == "pkg._raw_api.load_lib"][0]
+        self.assertEqual(body["resolution"], "parameter")
+        self.assertIsNone(body["library"])
+
+    def test_unresolved_name_is_still_a_site(self):
+        self.write("pkg/__init__.py")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import ctypes",
+                    "def load(v):",
+                    "    return ctypes.CDLL(f'lib{v}.so')",
+                    "",
+                ]
+            ),
+        )
+        doc = self.fasten(self.generate())
+        self.assertEqual(len(doc["dynamicLoads"]), 1)
+        self.assertEqual(doc["dynamicLoads"][0]["resolution"], "unresolved")
+        self.assertIsNone(doc["dynamicLoads"][0]["library"])
 
 
 class SuffixTest(TestBase):

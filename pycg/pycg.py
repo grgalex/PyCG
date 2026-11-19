@@ -33,6 +33,7 @@ from pycg.machinery.scopes import ScopeManager
 from pycg.machinery.native import NativeRegistry
 from pycg.processing.cgprocessor import CallGraphProcessor
 from pycg.processing.keyerrprocessor import KeyErrProcessor
+from pycg.processing.nativeprocessor import NativeLoadProcessor
 from pycg.processing.postprocessor import PostProcessor
 from pycg.processing.preprocessor import PreProcessor
 # import tracemalloc
@@ -341,6 +342,23 @@ class CallGraphGenerator(object):
 
         self.reset_counters()
         if self.operation == utils.constants.CALL_GRAPH_OP:
+            # Dynamic loads: a wrapper may call a wrapper, and the pass only
+            # learns a wrapper when it sees its body, so iterate until the
+            # registry stops growing (bounded; three levels is already rare).
+            for _ in range(4):
+                before = self.native.state_key()
+                self.do_pass(
+                    NativeLoadProcessor,
+                    False,
+                    self.import_manager,
+                    self.scope_manager,
+                    self.def_manager,
+                    self.class_manager,
+                    self.module_manager,
+                    self.native,
+                )
+                if self.native.state_key() == before:
+                    break
             self.do_pass(
                 CallGraphProcessor,
                 False,
@@ -394,6 +412,9 @@ class CallGraphGenerator(object):
 
     def output_internal_mods(self):
         return self._generate_mods(self.module_manager.get_internal_modules())
+
+    def output_dynamic_loads(self):
+        return self.native.output_dynamic_loads()
 
     def output_external_mods(self):
         return self._generate_mods(self.module_manager.get_external_modules())

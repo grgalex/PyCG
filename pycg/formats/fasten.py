@@ -281,4 +281,8 @@ class Fasten(BaseFormatter):
         incomplete = getattr(self.cg_generator, "incomplete", None)
         if incomplete:
             res["incomplete"] = incomplete
+        output_loads = getattr(self.cg_generator, "output_dynamic_loads", None)
+        loads = output_loads() if output_loads else []
+        if loads:
+            res["dynamicLoads"] = loads
         return res

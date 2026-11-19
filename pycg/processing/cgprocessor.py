@@ -160,11 +160,21 @@ class CallGraphProcessor(ProcessingBase):
         return mod
 
     def _ext_node(self, name, ext_modname, metadata=None):
-        """Register `name` under external module `ext_modname`."""
+        """Register `name` under external module `ext_modname`.
+
+        Dynamically loaded libraries carry their load sites so a consumer
+        can tell them from PyPI dependencies.
+        """
         ext_mod = self.module_manager.get(ext_modname)
         if not ext_mod:
             ext_mod = self.module_manager.create(ext_modname, None, external=True)
             ext_mod.add_method(ext_modname)
+        if self.native is not None and ext_modname.startswith("dlopen:"):
+            library = ext_modname[len("dlopen:") :]
+            rec = self.native.libraries.get(library)
+            if rec and rec.get("file") and not ext_mod.get_filename():
+                ext_mod.set_filename(rec["file"])
+            ext_mod.set_metadata(self.native.library_metadata(library))
         ext_mod.add_method(name, metadata=metadata)
 
     def _callee_module(self, name):
@@ -175,6 +185,43 @@ class CallGraphProcessor(ProcessingBase):
             if dotted:
                 return dotted, True
         return name.split(".")[0], False
+
+    def _dynamic_symbol_edges(self, node):
+        """`handle.sym(...)` where `handle` holds a dlopen'ed library."""
+        if self.native is None or not isinstance(node.func, ast.Attribute):
+            return False
+        base = node.func.value
+        libraries = set()
+        if isinstance(base, ast.Call):
+            libraries |= self.native.call_handles.get(
+                (self.modname, base.lineno, base.col_offset), set()
+            )
+        names = set()
+        for d in self.decode_node(base):
+            if isinstance(d, Definition):
+                names.add(d.get_ns())
+        if isinstance(base, ast.Attribute):
+            # `self._lib`: decode_node hands back what the attribute closes
+            # to (the loader), not the attribute itself, and the handle is
+            # bound to the attribute `pkg.mod.W._lib`.
+            for parent in self._retrieve_parent_names(base):
+                cls = self.class_manager.get(parent)
+                for owner in (cls.get_mro() if cls else [parent]):
+                    names.add(utils.join_ns(owner, base.attr))
+        libraries |= self.native.libraries_reachable(self.def_manager, names)
+        if not libraries:
+            return False
+        symbol = node.func.attr
+        for library in sorted(libraries):
+            ext_modname = "dlopen:" + library
+            name = utils.join_ns(ext_modname, symbol)
+            if not self.def_manager.get(name):
+                self.def_manager.create(name, utils.constants.EXT_DEF)
+            self.native.add_symbol(library, symbol, self.current_method)
+            self._ext_node(name, ext_modname, {"kind": "dynamic-symbol", "symbol": symbol})
+            self.call_graph.add_node(name, ext_modname)
+            self.call_graph.add_edge(self.current_method, name)
+        return True
 
     def _dynamic_import_edges(self, node, names):
         """`importlib.import_module("pkg.mod")` is an import too."""
@@ -220,6 +267,9 @@ class CallGraphProcessor(ProcessingBase):
             self.visit(keyword.value)
 
         self.visit(node.func)
+
+        if self._dynamic_symbol_edges(node):
+            return
 
         names = self.retrieve_call_names(node)
         if names:
