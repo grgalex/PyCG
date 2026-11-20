@@ -206,6 +206,20 @@ class ProcessingBase(ast.NodeVisitor):
             return [self.scope_manager.get_def(self.current_ns, node.id)]
         elif isinstance(node, ast.Call):
             decoded = self.decode_node(node.func)
+            # a name bound to a callable (`HMAC = rust.hmac.HMAC`, then
+            # `h = HMAC(k)`) stands for what it points at
+            closured = getattr(self, "closured", None)
+            if closured:
+                expanded = []
+                for called_def in decoded:
+                    if isinstance(called_def, Definition) and \
+                            called_def.get_type() == utils.constants.NAME_DEF:
+                        for ns in closured.get(called_def.get_ns(), ()):
+                            target = self.def_manager.get(ns)
+                            if target:
+                                expanded.append(target)
+                    expanded.append(called_def)
+                decoded = expanded
             return_defs = []
             for called_def in decoded:
                 if not isinstance(called_def, Definition):
@@ -253,6 +267,8 @@ class ProcessingBase(ast.NodeVisitor):
                 defi = self.def_manager.get(name)
                 if defi:
                     defis.append(defi)
+            if not defis:
+                defis = self._external_attribute_defs(node)
             return defis
         elif isinstance(node, ast.Num):
             return [node.n]
@@ -313,6 +329,38 @@ class ProcessingBase(ast.NodeVisitor):
                     names.add(item)
         return names
 
+    def _external_attribute_defs(self, node):
+        """`rust.hmac.HMAC` where `rust` is an imported external module:
+        the external definition of the dotted name, created on demand.
+
+        The preprocessor has no closure yet, so an alias assigned from
+        such a chain (`HMAC = rust.hmac.HMAC`) used to get no pointer in
+        that pass, and a module processed before the alias's own module
+        saw nothing behind it within one iteration.
+        """
+        attrs = []
+        base = node
+        while isinstance(base, ast.Attribute):
+            attrs.insert(0, base.attr)
+            base = base.value
+        if not isinstance(base, ast.Name):
+            return []
+        defi = self.scope_manager.get_def(self.current_ns, base.id)
+        if not defi or defi.get_type() != utils.constants.EXT_DEF:
+            return []
+        roots = set(defi.get_name_pointer().get()) or {defi.get_ns()}
+        out = []
+        for root in roots:
+            root_def = self.def_manager.get(root)
+            if root_def and root_def.get_type() != utils.constants.EXT_DEF:
+                continue
+            ns = utils.join_ns(root, *attrs)
+            ext = self.def_manager.get(ns)
+            if not ext:
+                ext = self.def_manager.create(ns, utils.constants.EXT_DEF)
+            out.append(ext)
+        return out
+
     def _retrieve_parent_names(self, node):
         if not isinstance(node, ast.Attribute):
             raise Exception("The node is not an attribute")
@@ -340,7 +388,13 @@ class ProcessingBase(ast.NodeVisitor):
         parent_names = self._retrieve_parent_names(node)
         names = set()
         for parent_name in parent_names:
-            for name in self.closured.get(parent_name, []):
+            # an external attribute created during this pass (`rust.hmac`
+            # of `rust.hmac.HMAC`) is not in the closure computed at its
+            # start; it is a leaf, its own closure
+            closed = self.closured.get(parent_name)
+            if not closed and self.def_manager.get(parent_name):
+                closed = [parent_name]
+            for name in closed or []:
                 defi = self.def_manager.get(name)
                 if not defi:
                     continue
@@ -357,9 +411,13 @@ class ProcessingBase(ast.NodeVisitor):
                     # `pkg.fast_sum` bound by `from .core._speedups import
                     # fast_sum` is an alias: the callee is what it points
                     # at, not the alias itself.
+                    # ... and so is a module-level name bound to one
+                    # (`DSAPublicNumbers = rust.dsa.DSAPublicNumbers`, called
+                    # as `dsa.DSAPublicNumbers(...)` from another module)
                     if (
                         attr_def
-                        and attr_def.get_type() == utils.constants.EXT_DEF
+                        and attr_def.get_type() in (utils.constants.EXT_DEF,
+                                                    utils.constants.NAME_DEF)
                         and self.closured.get(attr_ns)
                         and self.closured.get(attr_ns) != {attr_ns}
                     ):

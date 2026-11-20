@@ -60,10 +60,12 @@ class PostProcessor(ProcessingBase):
 
         names = self.retrieve_call_names(node)
         if not names:
+            self._visit_call_args(node)
             return
 
         self.last_called_names = names
 
+        visited = False
         for name in names:
             defi = self.def_manager.get(name)
             if not defi:
@@ -76,9 +78,28 @@ class PostProcessor(ProcessingBase):
                 if not defi:
                     continue
             self.iterate_call_args(defi, node)
+            visited = True
+        if not visited:
+            self._visit_call_args(node)
+
+    def _visit_call_args(self, node):
+        """Arguments of a call with no known callee (`property(lambda self:
+        ...)`): a lambda literal in them keeps the `<lambdaN>` number the
+        preprocessor gave it only if this pass counts it too."""
+        for arg in node.args:
+            self.visit(arg)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
 
     def visit_Assign(self, node):
         self._visit_assign(node.value, node.targets)
+
+    def visit_AnnAssign(self, node):
+        # `ffi: Any = cffi.FFI()` defines `ffi` as much as `ffi = ...` does;
+        # without this the name had no definition and every `ffi.dlopen`
+        # was invisible
+        if node.value is not None:
+            self._visit_assign(node.value, [node.target])
 
     # Redefined in line 118, 121
     # def visit_Return(self, node):
@@ -101,8 +122,10 @@ class PostProcessor(ProcessingBase):
                 for item in iter_decoded:
                     if not isinstance(item, Definition):
                         continue
-                    # return value for generators
-                    for name in self.closured.get(item.get_ns(), []):
+                    # return value for generators: the return definition
+                    # itself as well as what it points at -- a yielded
+                    # string literal lives only on that definition
+                    for name in self.closured.get(item.get_ns(), set()) | {item.get_ns()}:
                         # If there exists a next method on the iterable
                         # and if yes, add a pointer to it
                         next_defi = self.def_manager.get(

@@ -480,6 +480,13 @@ class PreProcessor(ProcessingBase):
     def visit_Assign(self, node):
         self._visit_assign(node.value, node.targets)
 
+    def visit_AnnAssign(self, node):
+        # `ffi: Any = cffi.FFI()` defines `ffi` as much as `ffi = ...` does;
+        # without this the name had no definition and every `ffi.dlopen`
+        # was invisible
+        if node.value is not None:
+            self._visit_assign(node.value, [node.target])
+
     def visit_Return(self, node):
         self._visit_return(node)
 
@@ -492,12 +499,14 @@ class PreProcessor(ProcessingBase):
         # ModuleVisitor will be able to resolve those calls
         # since it'll have the name tracking information
         if not isinstance(node.func, ast.Name):
+            self._visit_call_args(node)
             return
 
         utils.join_ns(self.current_ns, node.func.id)
 
         defi = self.scope_manager.get_def(self.current_ns, node.func.id)
         if not defi:
+            self._visit_call_args(node)
             return
 
         if defi.get_type() == utils.constants.CLS_DEF:
@@ -505,9 +514,20 @@ class PreProcessor(ProcessingBase):
                 utils.join_ns(defi.get_ns(), utils.constants.CLS_INIT)
             )
             if not defi:
+                self._visit_call_args(node)
                 return
 
         self.iterate_call_args(defi, node)
+
+    def _visit_call_args(self, node):
+        """The arguments of a call whose callee is not a known function:
+        a lambda (or dict, list) literal passed to it -- `property(lambda
+        self: ...)` -- still needs its definition and its `<lambdaN>`
+        number; `iterate_call_args` visits them for known callees."""
+        for arg in node.args:
+            self.visit(arg)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
 
     def visit_Lambda(self, node):
         # The name of a lambda is defined by the counter of the current scope
