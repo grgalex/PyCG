@@ -19,6 +19,7 @@
 # under the License.
 #
 import ast
+import re
 import os
 
 from pycg import utils
@@ -186,11 +187,31 @@ class CallGraphProcessor(ProcessingBase):
                 return dotted, True
         return name.split(".")[0], False
 
+    def visit_Attribute(self, node):
+        # `f = handle.sym` is a symbol lookup (ctypes/cffi dlsym on attribute
+        # access) even when the call comes later through `f`; record it where
+        # the attribute is read. An UPPER_CASE read is a cffi cdef constant
+        # (`lib.SFC_GET_LOG_INFO`), not a function.
+        if not re.fullmatch(r"[A-Z0-9_]+", node.attr):
+            self._dynamic_symbol_ref(node)
+        self.generic_visit(node)
+
     def _dynamic_symbol_edges(self, node):
         """`handle.sym(...)` where `handle` holds a dlopen'ed library."""
-        if self.native is None or not isinstance(node.func, ast.Attribute):
+        if not isinstance(node.func, ast.Attribute):
             return False
-        base = node.func.value
+        return self._dynamic_symbol_ref(node.func)
+
+    def _dynamic_symbol_ref(self, attr):
+        """`handle.sym`, read or called, where `handle` holds a dlopen'ed
+        library: a `dlopen:<library>.sym` node and an edge to it."""
+        if self.native is None:
+            return False
+        node = attr
+        base = attr.value
+        if isinstance(base, ast.Subscript):
+            # `handles['x'].sym`: the handle was bound to the container
+            base = base.value
         libraries = set()
         if isinstance(base, ast.Call):
             libraries |= self.native.call_handles.get(
@@ -211,7 +232,7 @@ class CallGraphProcessor(ProcessingBase):
         libraries |= self.native.libraries_reachable(self.def_manager, names)
         if not libraries:
             return False
-        symbol = node.func.attr
+        symbol = attr.attr
         for library in sorted(libraries):
             ext_modname = "dlopen:" + library
             name = utils.join_ns(ext_modname, symbol)
