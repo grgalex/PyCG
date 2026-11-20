@@ -422,6 +422,10 @@ class ProcessingBase(ast.NodeVisitor):
                         and self.closured.get(attr_ns) != {attr_ns}
                     ):
                         names = names.union(self.closured.get(attr_ns))
+                        if attr_def.get_type() == utils.constants.NAME_DEF:
+                            # the name itself too: a dlopen handle is bound
+                            # to it (`lib = _mode_ocb._raw_ocb_lib`)
+                            names.add(attr_ns)
                     else:
                         names.add(attr_ns)
                 if defi.get_type() == utils.constants.EXT_DEF:
