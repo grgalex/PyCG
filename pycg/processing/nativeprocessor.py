@@ -36,14 +36,22 @@ from pycg.machinery.definitions import Definition
 from pycg.processing.base import ProcessingBase
 
 
+# candidate library names one expression may produce; beyond this the
+# argument is a computed name, not a choice between a few
+MAX_CANDIDATES = 32
+
+
 class LoadInfo:
-    def __init__(self, primitives, via, libraries, files, resolution, param_index=None):
+    def __init__(self, primitives, via, libraries, files, resolution, param_index=None,
+                 slots=None):
         self.primitives = set(primitives)
         self.via = list(via)
         self.libraries = list(libraries)
         self.files = list(files)
         self.resolution = resolution
         self.param_index = param_index
+        # positions of the handle when the call returns a tuple
+        self.slots = set(slots) if slots else None
 
 
 class NativeLoadProcessor(ProcessingBase):
@@ -96,10 +104,19 @@ class NativeLoadProcessor(ProcessingBase):
         self.generic_visit(node)
         if node.value is None:
             return
+        return_ns = utils.join_ns(self.current_ns, utils.constants.RETURN_NAME)
+        if isinstance(node.value, ast.Tuple):
+            # `return lib, True`: the handle sits in a slot of the tuple
+            for i, elt in enumerate(node.value.elts):
+                info = self._load_info_of_value(elt)
+                if info is None:
+                    continue
+                self.native.bind_handle(return_ns, info.libraries)
+                self._summarise_wrapper(info, slots={i})
+            return
         info = self._load_info_of_value(node.value)
         if info is None:
             return
-        return_ns = utils.join_ns(self.current_ns, utils.constants.RETURN_NAME)
         self.native.bind_handle(return_ns, info.libraries)
         self._summarise_wrapper(info)
 
@@ -112,10 +129,35 @@ class NativeLoadProcessor(ProcessingBase):
     def _bind_targets(self, value, targets):
         info = self._load_info_of_value(value)
         if info is None:
+            # not a handle; perhaps a library name (`_libname =
+            # find_library('sndfile')`, `path = os.path.join(d, name)`)
+            libs, res, _pidx = self._resolve_library(value)
+            # only what the literal pointers cannot carry; binding every
+            # string-valued name fed products back into products across
+            # the fixpoint iterations until memory ran out (pycryptodome)
+            if libs and res in ("find_library", "path-join", "pattern"):
+                for target in targets:
+                    if isinstance(target, ast.Tuple):
+                        continue
+                    for tns in self._get_target_ns(target):
+                        if tns:
+                            self.native.bind_libname(tns, libs)
             return
         for target in targets:
             if isinstance(target, ast.Tuple):
+                # `lib, flag = load()` where the wrapper returns the handle
+                # in a known slot
+                for i in sorted(info.slots or ()):
+                    if i < len(target.elts) and not isinstance(
+                            target.elts[i], (ast.Tuple, ast.Starred)):
+                        for tns in self._get_target_ns(target.elts[i]):
+                            if tns and info.libraries:
+                                self.native.bind_handle(tns, info.libraries)
                 continue
+            if isinstance(target, ast.Subscript):
+                # `handles['x'] = CDLL(...)`: the handle is bound to the
+                # container; a read of any item of it yields the handle
+                target = target.value
             for tns in self._get_target_ns(target):
                 if not tns:
                     continue
@@ -139,6 +181,8 @@ class NativeLoadProcessor(ProcessingBase):
                 merged.libraries += i.libraries
                 merged.files += i.files
             return merged
+        if isinstance(value, ast.Subscript):
+            value = value.value
         if isinstance(value, (ast.Name, ast.Attribute)):
             names = set()
             for d in self.decode_node(value):
@@ -207,14 +251,16 @@ class NativeLoadProcessor(ProcessingBase):
         if primitives:
             arg = self._library_arg(node, 0)
             libraries, resolution, param_index = self._resolve_library(arg)
+        slots = set()
         for wrapper in wrappers:
             summary = self.native.loaders[wrapper]
             all_primitives |= summary.primitives
             via = [wrapper] + summary.via
+            if summary.handle_slots:
+                slots |= summary.handle_slots
             if summary.fixed:
                 libraries = libraries + list(summary.fixed)
                 resolution = "wrapper-constant"
-                continue
             if summary.param_index is None:
                 continue
             arg = self._library_arg(node, summary.param_index)
@@ -229,6 +275,14 @@ class NativeLoadProcessor(ProcessingBase):
 
         libraries = sorted(set(l for l in libraries if l))
         near = os.path.dirname(self.filename)
+        resolved = []
+        for lib in libraries:
+            if "*" in lib:
+                # a name with a hole stands for the files it matches
+                resolved += self.native.resolve_library_pattern(lib, near=near)
+            else:
+                resolved.append(lib)
+        libraries = sorted(set(resolved))
         files = [self.native.resolve_library_file(lib, near=near) for lib in libraries]
         try:
             expr = ast.unparse(node)
@@ -247,7 +301,15 @@ class NativeLoadProcessor(ProcessingBase):
             resolution,
         )
         self.native.bind_call_handle(self.modname, node.lineno, node.col_offset, libraries)
-        return LoadInfo(all_primitives, via, libraries, files, resolution, param_index)
+        info = LoadInfo(all_primitives, via, libraries, files, resolution, param_index,
+                        slots=slots)
+        if self.fn_stack and libraries and resolution not in (
+                "unresolved", "alias", "parameter"):
+            # a function that loads a known library is a loader whatever it
+            # returns: calling it is where the library gets loaded from the
+            # caller's side (`_ghash_portable = _get_ghash_portable()`)
+            self._summarise_wrapper(info)
+        return info
 
     def _library_arg(self, node, index):
         if index is not None and len(node.args) > index:
@@ -274,7 +336,18 @@ class NativeLoadProcessor(ProcessingBase):
             left, lres, _ = self._resolve_library(node.left)
             right, rres, _ = self._resolve_library(node.right)
             if left and right:
-                return [a + b for a in left for b in right], "literal", None
+                if len(left) * len(right) > MAX_CANDIDATES:
+                    return [], "unresolved", None
+                res = "pattern" if "pattern" in (lres, rres) else "literal"
+                return [a + b for a in left for b in right], res, None
+            # one side is computed (`'libsndfile_' + machine() + '.so'`):
+            # a name with a hole, matched against the package's files. The
+            # hole must follow a stem: `*.abi3.so` alone names every file.
+            if left and lres != "parameter":
+                return [a if a.endswith("*") else a + "*" for a in left], "pattern", None
+            if right and rres != "parameter" and all(
+                    b.startswith("*") and len(b.lstrip("*").split(".")[0]) >= 3 for b in right):
+                return right, "pattern", None
             return [], "unresolved", None
         if isinstance(node, ast.Call):
             names = self._callee_names(node)
@@ -283,15 +356,20 @@ class NativeLoadProcessor(ProcessingBase):
                 return libs, ("find_library" if libs else res), pidx
             if names & native.PATH_JOINERS:
                 parts = [self._resolve_library(a) for a in node.args]
-                # keep the trailing run of resolved components
+                # keep the trailing run of resolved components; each may
+                # have several candidates (a platform choice)
                 tail = []
+                pattern = False
                 for libs, res, _ in reversed(parts):
-                    if libs and len(libs) == 1:
-                        tail.insert(0, libs[0])
+                    if libs and len(libs) <= 8:
+                        tail.insert(0, libs)
+                        pattern = pattern or res == "pattern"
                     else:
                         break
                 if tail:
-                    return [os.path.join(*tail)], "path-join", None
+                    import itertools
+                    joined = [os.path.join(*combo) for combo in itertools.product(*tail)]
+                    return sorted(set(joined))[:MAX_CANDIDATES], ("pattern" if pattern else "path-join"), None
                 return [], "unresolved", None
             if names & native.PATH_PASSTHROUGH and node.args:
                 return self._resolve_library(node.args[0])
@@ -301,9 +379,23 @@ class NativeLoadProcessor(ProcessingBase):
             if pidx is not None:
                 return [], "parameter", pidx
         if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
-            lits = self._string_literals_of(node)
-            if lits:
-                return sorted(lits), "name-constant", None
+            # a literal with a format hole ('./%s.dll', '{}.so') is a
+            # template the name was built from, not a library name
+            lits = {l for l in self._string_literals_of(node)
+                    if "%" not in l and "{" not in l}
+            names = set()
+            for d in self.decode_node(node):
+                if isinstance(d, Definition):
+                    names.add(d.get_ns())
+            bound = self.native.libnames_reachable(self.def_manager, names)
+            if lits or bound:
+                res = "name-constant"
+                if bound and any("*" in b for b in bound):
+                    res = "pattern"
+                # what the name was assigned, when that was seen, rather
+                # than the string pieces of those assignments (the literal
+                # pointer of `'lib' + f() + '.so'` holds 'lib' and '.so')
+                return sorted(bound or lits)[:MAX_CANDIDATES], res, None
         return [], "unresolved", None
 
     def _parameter_index(self, name):
@@ -320,26 +412,37 @@ class NativeLoadProcessor(ProcessingBase):
         return None
 
     def _string_literals_of(self, node):
+        """String literals the expression can hold, following name pointers
+        through every definition on the way (the transitive closure keeps
+        only the leaves of a chain, and a generator's yielded literal sits
+        on its `<RETURN>` definition, which also points at other names)."""
         lits = set()
+        todo = []
         for d in self.decode_node(node):
             if isinstance(d, str):
                 lits.add(d)
+            elif isinstance(d, Definition):
+                todo.append(d.get_ns())
+        seen = set()
+        while todo:
+            ns = todo.pop()
+            if ns in seen:
                 continue
-            if not isinstance(d, Definition):
+            seen.add(ns)
+            defi = self.def_manager.get(ns)
+            if not defi:
                 continue
-            for ns in self.closured.get(d.get_ns(), ()) | {d.get_ns()}:
-                defi = self.def_manager.get(ns)
-                if not defi:
-                    continue
-                for lit in defi.get_lit_pointer().get():
-                    if isinstance(lit, str):
-                        lits.add(lit)
+            for lit in defi.get_lit_pointer().get():
+                if isinstance(lit, str):
+                    lits.add(lit)
+            todo.extend(defi.get_name_pointer().get())
         return lits
 
     # ---- wrappers ----------------------------------------------------------
 
-    def _summarise_wrapper(self, info):
-        """The current function returns a handle: make it a loader."""
+    def _summarise_wrapper(self, info, slots=None):
+        """The current function returns a handle (in tuple `slots`, when
+        given) or loads a known library: make it a loader."""
         if not self.fn_stack:
             return
         fn_ns = self.current_ns
@@ -351,7 +454,7 @@ class NativeLoadProcessor(ProcessingBase):
             # a method's `self` is counted in the AST but not by callers
             if self._is_method(self.fn_stack[-1]):
                 param_index -= 1
-        elif info.libraries and info.resolution not in ("unresolved", "alias"):
+        elif info.libraries and info.resolution not in ("unresolved", "alias", "pattern"):
             fixed = list(info.libraries)
         else:
             fn = self.fn_stack[-1]
@@ -372,7 +475,8 @@ class NativeLoadProcessor(ProcessingBase):
                 primitives |= summary.primitives
         self.native.set_loader(
             fn_ns,
-            native.LoaderSummary(param_index, fixed, primitives, info.via, resolution),
+            native.LoaderSummary(param_index, fixed, primitives, info.via, resolution,
+                                 handle_slots=slots),
         )
 
     def _is_method(self, fn):

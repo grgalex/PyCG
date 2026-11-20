@@ -129,12 +129,16 @@ class LoaderSummary:
     name could not be followed and the first string argument is assumed.
     """
 
-    def __init__(self, param_index, fixed, primitives, via, resolution):
+    def __init__(self, param_index, fixed, primitives, via, resolution,
+                 handle_slots=None):
         self.param_index = param_index
         self.fixed = fixed
         self.primitives = set(primitives)
         self.via = list(via)
         self.resolution = resolution
+        # positions of the handle in a tuple the wrapper returns
+        # (`return lib, True` -> {0}); None when it returns the handle
+        self.handle_slots = set(handle_slots) if handle_slots else None
 
     def key(self):
         return (
@@ -143,7 +147,23 @@ class LoaderSummary:
             tuple(sorted(self.primitives)),
             tuple(self.via),
             self.resolution,
+            tuple(sorted(self.handle_slots or [])),
         )
+
+    def merge(self, other):
+        """One function can both load a fixed library and return a handle
+        built from a parameter; keep everything either summary found."""
+        if other.param_index is not None and self.param_index is None:
+            self.param_index = other.param_index
+            self.resolution = other.resolution
+        if other.fixed:
+            self.fixed = sorted(set(self.fixed or []) | set(other.fixed))
+        self.primitives |= other.primitives
+        if not self.via and other.via:
+            self.via = list(other.via)
+        if other.handle_slots:
+            self.handle_slots = (self.handle_slots or set()) | other.handle_slots
+        return self
 
 
 class NativeRegistry:
@@ -160,6 +180,7 @@ class NativeRegistry:
         self.load_sites = {}
         # definition namespace -> {library names}
         self.handles = {}
+        self.libnames = {}
         # (module, line, col) of a loader call -> {library names}
         self.call_handles = {}
         # function namespace -> LoaderSummary
@@ -281,6 +302,25 @@ class NativeRegistry:
                     return rel
         return sorted(matches, key=lambda r: (r.count(os.sep), r))[0]
 
+    def resolve_library_pattern(self, pattern, near=None):
+        """Files under the package root whose name matches a library name
+        with holes (`libsndfile_*.so` from `'libsndfile_' + machine() +
+        '.so'`); those in `near` first."""
+        import fnmatch
+        if not pattern or not self.package_root:
+            return []
+        name = os.path.basename(pattern)
+        matches = []
+        for fn, rels in self._index_files().items():
+            if fnmatch.fnmatchcase(fn, name):
+                matches.extend(rels)
+        if near:
+            near_rel = os.path.relpath(near, self.package_root)
+            close = [r for r in matches if os.path.dirname(r) == near_rel]
+            if close:
+                return sorted(close)
+        return sorted(matches, key=lambda r: (r.count(os.sep), r))
+
     def library_record(self, library):
         rec = self.libraries.get(library)
         if rec is None:
@@ -328,6 +368,29 @@ class NativeRegistry:
         if not libraries:
             return
         self.handles.setdefault(def_ns, set()).update(libraries)
+
+    def bind_libname(self, def_ns, libraries):
+        """`name` holds a library *name* (`find_library('x')`, a path
+        join): what a later `CDLL(name)` loads."""
+        if not libraries:
+            return
+        self.libnames.setdefault(def_ns, set()).update(libraries)
+
+    def libnames_reachable(self, def_manager, names):
+        libs = set()
+        seen = set()
+        todo = list(names)
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            libs.update(self.libnames.get(name, ()))
+            defi = def_manager.get(name)
+            if not defi:
+                continue
+            todo.extend(defi.get_name_pointer().get())
+        return libs
 
     def bind_call_handle(self, modname, lineno, col, libraries):
         if not libraries:
@@ -388,10 +451,12 @@ class NativeRegistry:
 
     def set_loader(self, fn_ns, summary):
         old = self.loaders.get(fn_ns)
-        if old is not None and old.key() == summary.key():
-            return False
-        self.loaders[fn_ns] = summary
-        return True
+        if old is None:
+            self.loaders[fn_ns] = summary
+            return True
+        before = old.key()
+        old.merge(summary)
+        return old.key() != before
 
     def state_key(self):
         return (

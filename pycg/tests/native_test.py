@@ -368,6 +368,258 @@ class DynamicLoadTest(NativeTestBase):
         self.assertIsNone(doc["dynamicLoads"][0]["library"])
 
 
+class ExtensionAliasTest(NativeTestBase):
+    """A module-level name bound to an attribute of a compiled module
+    (`HMAC = rust_openssl.hmac.HMAC`) is that attribute wherever it is
+    called from, and an object it returns carries its methods."""
+
+    def test_alias_of_a_compiled_attribute(self):
+        self.write("pkg/__init__.py")
+        self.write("pkg/bindings/__init__.py")
+        self.write("pkg/bindings/_rust.abi3.so")
+        self.write(
+            "pkg/hmac.py",
+            "\n".join(
+                [
+                    "from pkg.bindings._rust import openssl as rust_openssl",
+                    "HMAC = rust_openssl.hmac.HMAC",
+                    "Numbers = rust_openssl.dsa.Numbers",
+                    "",
+                ]
+            ),
+        )
+        # processed before pkg.hmac (alphabetical), within one iteration
+        self.write(
+            "pkg/fernet.py",
+            "\n".join(
+                [
+                    "from pkg.hmac import HMAC",
+                    "from pkg import hmac as hm",
+                    "def enc(k):",
+                    "    h = HMAC(k)",
+                    "    h.update(k)",
+                    "    return hm.Numbers(k)",
+                    "",
+                ]
+            ),
+        )
+        edges = self.edges(self.generate())
+        self.assertIn(("pkg.fernet.enc", "pkg.bindings._rust.openssl.hmac.HMAC"), edges)
+        self.assertIn(("pkg.fernet.enc", "pkg.bindings._rust.openssl.hmac.HMAC.update"), edges)
+        self.assertIn(("pkg.fernet.enc", "pkg.bindings._rust.openssl.dsa.Numbers"), edges)
+
+
+class LoadArgumentTest(NativeTestBase):
+    """Library names that reach the loader through a variable, a loop, a
+    name with a hole, a tuple, or a function that loads on the side."""
+
+    def _loads(self, cg):
+        return {(l["namespace"], l["line"]): l for l in self.fasten(cg)["dynamicLoads"]}
+
+    def test_loop_over_a_generator_of_names(self):
+        # python-magic: `for lib in _lib_candidates(): ctypes.CDLL(lib)`;
+        # the yielded literal sits on the generator's return definition
+        self.write("pkg/__init__.py")
+        self.write(
+            "pkg/loader.py",
+            "\n".join(
+                [
+                    "import ctypes",
+                    "from ctypes.util import find_library",
+                    "def _candidates():",
+                    "    yield find_library('magic')",
+                    "    yield './%s.dll' % 'libmagic'",
+                    "    yield 'libmagic.so.1'",
+                    "def load_lib():",
+                    "    for lib in _candidates():",
+                    "        return ctypes.CDLL(lib)",
+                    "",
+                ]
+            ),
+        )
+        self.write(
+            "pkg/__init__.py",
+            "\n".join(
+                [
+                    "from . import loader",
+                    "libmagic = loader.load_lib()",
+                    "_libraries = {}",
+                    "_libraries['magic'] = loader.load_lib()",
+                    "magic_open = libmagic.magic_open",
+                    "def check():",
+                    "    return _libraries['magic'].magic_check()",
+                    "",
+                ]
+            ),
+        )
+        cg = self.generate()
+        loads = self._loads(cg)
+        self.assertEqual(loads[("pkg.loader.load_lib", 9)]["library"], "libmagic.so.1")
+        # the template './%s.dll' is not a library name
+        self.assertEqual(loads[("pkg.loader.load_lib", 9)]["resolution"], "name-constant")
+        # a call of the loader function is a site of its own, via it
+        self.assertEqual(loads[("pkg", 2)]["via"], ["pkg.loader.load_lib"])
+        edges = self.edges(cg)
+        # a read of the symbol counts, not only a call of it
+        self.assertIn(("pkg", "dlopen:libmagic.so.1.magic_open"), edges)
+        # a handle stored in a container item is found through the container
+        self.assertIn(("pkg.check", "dlopen:libmagic.so.1.magic_check"), edges)
+
+    def test_name_from_find_library_and_platform_chain(self):
+        # soundfile: `_libname = find_library('sndfile'); ffi.dlopen(_libname)`
+        self.write("pkg/__init__.py")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import sys, ctypes",
+                    "from ctypes.util import find_library",
+                    "_libname = find_library('sndfile')",
+                    "_snd = ctypes.CDLL(_libname)",
+                    "if sys.platform == 'darwin':",
+                    "    _explicit = 'libsndfile.dylib'",
+                    "else:",
+                    "    _explicit = 'libsndfile.so'",
+                    "_snd2 = ctypes.CDLL(_explicit)",
+                    "version = _snd.sf_version_string()",
+                    "FLAG = _snd.SFC_GET_LOG_INFO",
+                    "",
+                ]
+            ),
+        )
+        cg = self.generate()
+        loads = self._loads(cg)
+        self.assertEqual(loads[("pkg.mod", 4)]["library"], "sndfile")
+        self.assertEqual(loads[("pkg.mod", 4)]["resolution"], "name-constant")
+        self.assertEqual(loads[("pkg.mod", 9)]["library"], ["libsndfile.dylib", "libsndfile.so"])
+        edges = self.edges(cg)
+        self.assertIn(("pkg.mod", "dlopen:sndfile.sf_version_string"), edges)
+        # an UPPER_CASE read is a cdef constant, not a symbol
+        self.assertNotIn(("pkg.mod", "dlopen:sndfile.SFC_GET_LOG_INFO"), edges)
+
+    def test_name_with_a_hole_matches_a_packaged_file(self):
+        # soundfile: os.path.join(dirname(__file__), 'libsndfile_' + machine() + '.so')
+        self.write("pkg/__init__.py")
+        self.write("pkg/_data/__init__.py")
+        self.write("pkg/_data/libsnd_x86_64.so")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import os, ctypes",
+                    "from platform import machine",
+                    "from pkg import _data",
+                    "_name = 'libsnd_' + machine() + '.so'",
+                    "_path = os.path.join(os.path.dirname(_data.__file__), _name)",
+                    "_snd = ctypes.CDLL(_path)",
+                    "",
+                ]
+            ),
+        )
+        cg = self.generate()
+        site = self._loads(cg)[("pkg.mod", 6)]
+        self.assertEqual(site["file"], "pkg/_data/libsnd_x86_64.so")
+        self.assertEqual(site["resolution"], "pattern")
+
+    def test_suffix_only_hole_matches_nothing(self):
+        self.write("pkg/__init__.py")
+        self.write("pkg/_raw_x.abi3.so")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import ctypes",
+                    "def load(name):",
+                    "    return ctypes.CDLL(name.split('.')[-1] + '.abi3.so')",
+                    "",
+                ]
+            ),
+        )
+        site = self._loads(self.generate())[("pkg.mod.load", 3)]
+        self.assertIsNone(site["library"])
+
+    def test_annotated_assignment_defines_the_ffi(self):
+        # pycryptodome: `ffi: Any = cffi.FFI()` then `ffi.dlopen(name)`
+        self.write("pkg/__init__.py")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "from typing import Any",
+                    "import cffi",
+                    "ffi: Any = cffi.FFI()",
+                    "def load_lib(name):",
+                    "    return ffi.dlopen(name)",
+                    "",
+                ]
+            ),
+        )
+        site = self._loads(self.generate())[("pkg.mod.load_lib", 5)]
+        self.assertEqual(site["loader"], "cffi.FFI.dlopen")
+        self.assertEqual(site["resolution"], "parameter")
+
+    def test_loader_function_and_tuple_slot(self):
+        # pycryptodome: `_ec_lib, _bmi2 = load_ec_lib(cdecl)` where load_ec_lib
+        # loads a fixed library and returns (handle, flag); and a function
+        # that loads but returns something else is still a loader
+        self.write("pkg/__init__.py")
+        self.write("pkg/_ec_nat.abi3.so")
+        self.write(
+            "pkg/_ec_lib.py",
+            "\n".join(
+                [
+                    "import ctypes",
+                    "def load_ec_lib(cdecl):",
+                    "    return ctypes.CDLL('pkg._ec_nat'), True",
+                    "def build():",
+                    "    lib = ctypes.CDLL('pkg._ec_nat')",
+                    "    return [lib.ec_new]",
+                    "",
+                ]
+            ),
+        )
+        self.write(
+            "pkg/ecc.py",
+            "\n".join(
+                [
+                    "from pkg._ec_lib import load_ec_lib, build",
+                    "_ec_lib, _bmi2 = load_ec_lib('int ec_new(void);')",
+                    "_impl = build()",
+                    "def new():",
+                    "    return _ec_lib.ec_new()",
+                    "",
+                ]
+            ),
+        )
+        cg = self.generate()
+        loads = self._loads(cg)
+        self.assertEqual(loads[("pkg.ecc", 2)]["via"], ["pkg._ec_lib.load_ec_lib"])
+        self.assertEqual(loads[("pkg.ecc", 2)]["file"], "pkg/_ec_nat.abi3.so")
+        self.assertEqual(loads[("pkg.ecc", 3)]["via"], ["pkg._ec_lib.build"])
+        self.assertIn(("pkg.ecc.new", "dlopen:pkg._ec_nat.ec_new"), self.edges(cg))
+
+    def test_lambda_passed_to_an_unknown_callee_is_defined(self):
+        # soundfile: `_errorcode = property(lambda self: _snd.sf_error(self._file))`
+        self.write("pkg/__init__.py")
+        self.write(
+            "pkg/mod.py",
+            "\n".join(
+                [
+                    "import ctypes",
+                    "_snd = ctypes.CDLL('libsndfile.so')",
+                    "class SoundFile:",
+                    "    name = property(lambda self: self._name)",
+                    "    _errorcode = property(lambda self: _snd.sf_error(self._file))",
+                    "",
+                ]
+            ),
+        )
+        self.assertIn(
+            ("pkg.mod.SoundFile.<lambda2>", "dlopen:libsndfile.so.sf_error"),
+            self.edges(self.generate()),
+        )
+
+
 class SuffixTest(TestBase):
     def test_strip_extension_suffix(self):
         cases = {
